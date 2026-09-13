@@ -1,0 +1,368 @@
+# Turbo Rating
+
+Минимальный MVP: асинхронный `OpenDotaClient` на `httpx`, проверка API
+и локальное хранение игроков и матчей в SQLite через стандартный `sqlite3`.
+Telegram-бот на aiogram 3 поддерживает `/start`, `/add`, `/profile`, `/matches`,
+`/sync`, `/rating`, `/stats` и `/top`. Turbo Rating зависит только от побед и поражений в Turbo.
+Пока бот запущен, привязанные аккаунты автоматически синхронизируются.
+
+Требуется Python 3.11 или новее.
+
+## Структура
+
+```text
+app/
+    __init__.py
+    autosync.py
+    bot.py
+    db.py
+    keyboards.py
+    notifications.py
+    services/
+        __init__.py
+        game_modes.py
+        heroes.py
+        opendota.py
+        rating.py
+        sync.py
+scripts/
+    __init__.py
+    test_autosync.py
+    test_opendota.py
+    test_rating.py
+    test_sync.py
+    test_ux.py
+data/
+    turbo_rating.db  # создаётся автоматически
+main.py
+requirements.txt
+.env
+.gitignore
+README.md
+```
+
+## Установка
+
+Из корня проекта в PowerShell:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+На Linux/macOS путь к Python окружения: `.venv/bin/python`.
+
+## Настройка
+
+Заполните `.env` в корне проекта:
+
+```dotenv
+DOTA_ACCOUNT_ID=123456789
+OPENDOTA_API_KEY=
+TELEGRAM_BOT_TOKEN=
+```
+
+`123456789` — пример: замените его своим **Dota account_id (Steam32)**.
+Это числовой ID в ссылке `https://www.opendota.com/players/<account_id>`.
+SteamID64 и Telegram ID не подходят.
+
+Ключ OpenDota необязателен. `.env` исключён из Git; после клонирования
+создайте его по примеру выше. Переменные окружения имеют приоритет над `.env`.
+
+## Telegram-бот
+
+Запишите токен бота в `TELEGRAM_BOT_TOKEN` в `.env`, затем выполните:
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 main.py
+```
+
+Без токена программа выводит понятное сообщение и завершается с кодом 1.
+Бот получает обновления через polling.
+
+- `/start` — приглашение добавить аккаунт.
+- `/add 123456789` — проверка Dota ID через OpenDota и привязка к текущему
+  Telegram-пользователю. Сразу инициализирует и показывает стартовый рейтинг.
+  Замените пример своим Dota ID.
+- `/profile` — игрок, Dota ID, дата начала отслеживания в UTC,
+  Turbo Rating, количество Turbo-игр и winrate после регистрации.
+- `/matches` — последние 5 обычных сохранённых матчей, от новых к старым.
+  Имя героя, WIN/LOSE, режим и длительность в целых минутах.
+  Калибровочные матчи не показываются. Режимы: Turbo (23), All Pick (1),
+  Ranked All Pick (22); для остальных — `Mode #X`.
+- `/sync` — загрузка новых матчей привязанного игрока; после неё `/matches`
+  сразу показывает сохранённые игры. Начисления Turbo и итоговый рейтинг
+  выводятся прямо в ответе команды, без дополнительного уведомления.
+- `/rating` — текущий и стартовый рейтинг, разница между ними и последние
+  5 начислений с именами героев из `rating_history` + `matches`.
+  История не пересчитывается.
+- `/stats` — количество Turbo-матчей, побед, поражений и winrate после
+  `tracking_started_at`, текущий/стартовый рейтинг и их разница.
+  Калибровка и другие режимы исключены. Матчи без результата показываются
+  отдельным числом и не входят в знаменатель winrate; при отсутствии
+  завершённых матчей winrate равен 0.0%.
+- `/top` — до 20 игроков с уже инициализированным рейтингом, по убыванию
+  `current_rating`; при равенстве — по возрастанию `account_id`.
+  Каждый Dota аккаунт отображается один раз независимо от числа привязок Telegram.
+  Первые три места отмечены медалями, свой аккаунт — 👉. Если он ниже top-20,
+  внизу показаны его место и рейтинг с той же стабильной сортировкой.
+
+После `/start` и успешного `/add` доступна постоянная клавиатура:
+«🏆 Рейтинг», «📊 Статистика», «🥇 Топ», «🎮 Матчи», «🔄 Обновить».
+Кнопки используют те же обработчики, что и команды. При запуске бот регистрирует
+меню `/start`, `/add`, `/rating`, `/stats`, `/top`, `/matches`, `/sync`.
+Команда `/profile` также продолжает работать.
+
+`app/services/heroes.py` загружает `OpenDota constants/heroes` один раз при
+запуске с таймаутом 10 секунд и хранит имена в памяти до завершения процесса.
+`get_hero_name()` читает только кэш: HTTP-запросов на каждый матч нет.
+При сбое загрузки или неизвестном ID используется `Hero #44` (с нужным ID).
+Бот продолжает запуск; следующая попытка загрузки будет при перезапуске.
+
+Привязки хранятся в `telegram_users(telegram_id PRIMARY KEY, account_id)`.
+Повторный `/add` не создаёт дубликатов и не сбрасывает начало отслеживания.
+`/add` с другим Dota ID заменяет текущую привязку; история игроков сохраняется.
+Несколько Telegram-пользователей могут ссылаться на одного игрока.
+
+`/matches` читает SQLite. `/profile`, `/rating` и `/stats` инициализируют отсутствующий
+рейтинг через OpenDota, после чего читают сохранённый рейтинг.
+Для загрузки новых матчей используйте `/sync` или `scripts.test_sync`.
+Также загрузка выполняется автоматически, пока работает бот.
+
+## Автоматическая синхронизация
+
+`main.py` запускает бот и фоновую задачу `app/autosync.py`. Первый проход
+начинается сразу при запуске. Затем после каждого прохода задача ждёт
+`AUTO_SYNC_INTERVAL_SECONDS = 300` секунд и повторяет цикл.
+
+Синхронизируются только уникальные Dota ID из `telegram_users`, последовательно.
+Ошибка одного игрока не останавливает остальных. При завершении polling
+задача отменяется и ожидается её завершение; затем закрывается сессия Telegram.
+
+Если появились `rating_updates`, каждый Telegram-пользователь, привязанный
+к этому аккаунту, получает одно сообщение за проход. Несколько игр объединяются:
+показываются имена героев, отдельные изменения и рейтинг от первого `rating_before`
+до последнего `rating_after`. Для одной игры — победа/поражение, герой,
+изменение TR и рейтинг до/после. При большом числе игр показываются до 50 строк
+с ограничением общей длины и количество оставшихся, чтобы сохранить одно сообщение.
+Без новых начислений сообщение не отправляется. Ошибка доставки одному
+получателю не мешает другим; очередь повторной доставки пока не реализована.
+
+Ручной и автоматический sync используют один сервис. `asyncio.Lock` отдельный
+для каждого `account_id`, поэтому один аккаунт обрабатывается последовательно,
+а разные аккаунты могут синхронизироваться независимо. Lock действует внутри
+процесса; транзакции SQLite и уникальный ключ `rating_history` остаются защитой
+от повторного начисления. Формула рейтинга не изменена.
+
+Стандартный `logging` выводит запуск/остановку бота и autosync, Dota ID,
+число новых матчей и начислений, ошибки синхронизации и уведомлений.
+URL запросов с API key не выводятся в журнал.
+
+## Проверка API
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.test_opendota
+```
+
+Или передайте account_id аргументом, переопределив значение из `.env`:
+
+```powershell
+.\.venv\Scripts\python.exe -m scripts.test_opendota 123456789
+```
+
+Также поддерживается запуск `python scripts/test_opendota.py` из активированного
+окружения. Скрипт выводит имя игрока, account_id, число матчей и компактные
+строки: match_id, дата UTC, hero_id, WIN/LOSE и длительность в минутах.
+Он проверяет, что вернулось не больше 10 Turbo-матчей в порядке от новых к старым.
+Ошибки конфигурации, сети и HTTP завершают запуск с ненулевым кодом.
+
+Если OpenDota знает меньше 10 Turbo-матчей, результат будет короче.
+Пустой список — допустимый ответ API; это не подтверждение наличия матчей.
+Для получения истории включите «Общедоступную историю матчей» / «Expose Public
+Match Data» в Dota 2. В OpenDota могут отсутствовать ещё не загруженные матчи.
+
+## Синхронизация в SQLite
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m scripts.test_sync 123456789
+```
+
+Замените ID своим или опустите аргумент, чтобы использовать `DOTA_ACCOUNT_ID`
+из `.env`. Каталог `data` и база `data/turbo_rating.db` создаются автоматически
+относительно корня проекта. Дополнительные зависимости для БД не нужны.
+
+При первом запуске игрок получает `tracking_started_at`, равный текущему
+Unix-времени. Повторные запуски сохраняют это значение. Скрипт запрашивает
+страницы матчей любых режимов и сохраняет только те, у которых
+`start_time >= tracking_started_at`. Поэтому первый запуск обычно добавляет
+игрока и сохраняет 0 обычных матчей: предыдущие игры старше начала отслеживания.
+Отдельно сохраняется до 20 исторических Turbo-матчей для калибровки.
+
+Таблицы: `players` с ключом `account_id` и `matches` с составным ключом
+`(account_id, match_id)`. Повторная вставка не создаёт дубликаты.
+`save_match` вычисляет результат игрока по `player_slot` и `radiant_win`;
+если этих данных нет, результат хранится как `NULL` и выводится как `UNKNOWN`.
+
+Вывод содержит начало отслеживания в UTC, количество полученных, старых,
+повторных и новых матчей, новые матчи и общий размер истории игрока в БД.
+`fh_unavailable=true` вызывает предупреждение и не останавливает синхронизацию.
+База исключена из Git.
+
+Обычная синхронизация читает страницы по 50 матчей с offset до начала
+отслеживания или конца доступной истории. Это позволяет обработать игры после
+простоя, даже если их больше 20. Последняя страница может включать старые игры,
+которые будут пропущены. Обработка рейтинга выполняется по `start_time ASC`.
+При повторяющейся странице или превышении защитного лимита 1000 страниц
+запуск завершается ошибкой до сохранения новых матчей: история не считается
+успешно синхронизированной частично. Полнота зависит от данных OpenDota.
+История для калибровки загружается отдельно с offset, страницами по 50 матчей,
+не более 10 страниц. Остановка также происходит при наборе 20 подходящих матчей
+или неполной странице. Калибровка использует только доступную историю OpenDota.
+
+Общая логика находится в `app/services/sync.py`:
+
+- `ensure_player(account_id)` проверяет профиль через OpenDota и добавляет
+  игрока, сохраняя существующее начало отслеживания, и инициализирует рейтинг.
+  Используется `/add` и CLI.
+- `sync_player(account_id)` работает с уже добавленным игроком и возвращает
+  `SyncResult`: `received_count`, `new_count`, `new_matches`, `skipped_old`
+  и `skipped_duplicates`, а также `rating_changes` с начислениями этого запуска.
+  Дополнительно `rating_updates: list[RatingUpdate]` содержит `match_id`,
+  `start_time`, `hero_id`, `win`, `rating_before`, `rating_delta`, `rating_after`
+  для каждого нового начисления, от старых матчей к новым.
+  `new_matches` содержит сохранённые строки БД с `win`.
+
+Перед использованием сервиса нужно вызвать `db.init_db()` и загрузить `.env`
+в точке входа. При необходимости функции принимают необязательный `api_key`.
+Сервис не зависит от Telegram и ничего не печатает; SQL остаётся в `app/db.py`.
+
+## Turbo Rating
+
+Математика находится в `app/services/rating.py`:
+
+```text
+BASE_RATING = 1000.0
+ELO_SCALE = 400.0
+K_FACTOR = 32.0
+CALIBRATION_MATCHES = 20
+PRIOR_WINS = 5
+PRIOR_LOSSES = 5
+
+p = (W + 5) / (N + 10)
+initial_rating = 1000 + 400 * log10(p / (1 - p))
+
+E = 1 / (1 + 10 ** ((1000 - R) / 400))
+R_new = R + 32 * (S - E)  # S = 1 при победе, иначе 0
+```
+
+Начальный рейтинг рассчитывается один раз по самым новым (до 20) Turbo-матчам
+с `start_time < tracking_started_at`. Они помечены `is_calibration=1` и не создают
+`rating_history`. При отсутствии истории стартовый рейтинг равен 1000.
+Результаты без `player_slot` или `radiant_win` не считаются поражениями и
+не участвуют в рейтинге; неполные исторические матчи пропускаются.
+
+Для существующих игроков рейтинг лениво инициализируется при `/profile`,
+`/rating` или `/sync` с первоначальным `tracking_started_at`. Повторные вызовы
+не меняют стартовый рейтинг и состав калибровки. Ошибка API не фиксирует
+пустую калибровку: следующий вызов может повторить инициализацию.
+
+После регистрации рейтинг меняют только обычные Turbo-матчи (`game_mode=23`,
+`is_calibration=0`, `start_time >= tracking_started_at`) с известным результатом.
+За один sync они обрабатываются от старых к новым, при равном времени — по
+match_id. Остальные режимы сохраняются без изменения рейтинга.
+Внутри расчётов используется полная точность, в SQLite — REAL; только отображение
+округляется до целого. KDA, GPM, XPM, герой и серии побед не влияют на расчёт.
+
+Калибровка и создание `ratings` выполняются одной транзакцией. Начисления Elo
+и записи `rating_history` также фиксируются одной транзакцией с блокировкой
+записи. Пара `(account_id, match_id)` исключает повторное начисление.
+Sync обрабатывает также уже сохранённые подходящие матчи без `rating_history`
+(например, после сбоя или обновления MVP). Рейтинг игроков одного матча независим.
+
+## Таблицы SQLite
+
+- `players`: `account_id INTEGER PRIMARY KEY`, `nickname TEXT`,
+  `tracking_started_at INTEGER NOT NULL`, `created_at INTEGER NOT NULL`.
+- `matches`: `account_id INTEGER NOT NULL`, `match_id INTEGER NOT NULL`,
+  `start_time INTEGER NOT NULL`, `game_mode INTEGER`, `hero_id INTEGER`,
+  `player_slot INTEGER`, `radiant_win INTEGER`, `win INTEGER`, `duration INTEGER`,
+  `created_at INTEGER NOT NULL`, `is_calibration INTEGER NOT NULL DEFAULT 0`.
+  Первичный ключ — `(account_id, match_id)`.
+- `telegram_users`: `telegram_id INTEGER PRIMARY KEY`,
+  `account_id INTEGER NOT NULL REFERENCES players(account_id)`.
+
+```sql
+CREATE TABLE ratings (
+    account_id INTEGER PRIMARY KEY REFERENCES players(account_id),
+    initial_rating REAL NOT NULL,
+    current_rating REAL NOT NULL,
+    calibration_matches INTEGER NOT NULL,
+    calibration_wins INTEGER NOT NULL,
+    initialized_at INTEGER NOT NULL
+);
+
+CREATE TABLE rating_history (
+    account_id INTEGER NOT NULL REFERENCES ratings(account_id),
+    match_id INTEGER NOT NULL,
+    rating_before REAL NOT NULL,
+    expected_score REAL NOT NULL,
+    result INTEGER NOT NULL,
+    rating_delta REAL NOT NULL,
+    rating_after REAL NOT NULL,
+    created_at INTEGER NOT NULL,
+    PRIMARY KEY (account_id, match_id),
+    FOREIGN KEY (account_id, match_id) REFERENCES matches(account_id, match_id)
+);
+```
+
+`init_db()` добавляет недостающую колонку `matches.is_calibration` через
+`ALTER TABLE` после проверки `PRAGMA table_info`. Существующая БД, игроки,
+привязки и время начала отслеживания сохраняются. Новых зависимостей нет.
+
+## Тесты
+
+```powershell
+.\.venv\Scripts\python.exe -X utf8 -m unittest scripts.test_rating scripts.test_autosync scripts.test_ux -v
+```
+
+Тесты используют `unittest`, временную SQLite-базу и подставные ответы API.
+Проверяются математика, миграция, калибровка, пагинация, порядок начислений,
+идемпотентность, восстановление транзакций, отдельные рейтинги участников
+одного матча и команды Telegram. Также проверяются /top, per-account locks,
+отмена задач, восстановление после простоя, агрегированные уведомления,
+ошибки отдельных игроков и получателей. UX-тесты проверяют кэш и отказ constants,
+статистику без калибровки, последние 5 начислений, позицию ниже top-20,
+команды и кнопки через dispatcher, меню команд и имена героев в уведомлениях.
+Реальные сообщения не отправляются.
+
+## OpenDotaClient
+
+```python
+from app.services.opendota import OpenDotaClient
+
+async def example(account_id: int):
+    async with OpenDotaClient() as client:
+        player = await client.get_player(account_id)
+        matches = await client.get_recent_turbo_matches(account_id, limit=10)
+    return player, matches
+```
+
+Методы возвращают JSON как `dict` / `list[dict]`. Клиент использует таймаут
+20 секунд, вызывает `raise_for_status()` и закрывает соединения при выходе
+из `async with` (либо через `await client.aclose()`).
+
+Запросы:
+
+- `GET /players/{account_id}` — данные игрока.
+- `GET /players/{account_id}/matches?game_mode=23&limit=10&significant=0&sort=start_time`
+  — последние доступные Turbo-матчи.
+- `GET /players/{account_id}/matches?limit=20&significant=0&sort=start_time`
+  — последние матчи любых режимов через `get_recent_matches`.
+
+`significant=0` отключает стандартное исключение матчей, не учитываемых в
+статистике OpenDota, включая Turbo. API key, если задан, передаётся параметром
+`api_key`. Фильтрация и ограничение количества выполняются на стороне API.
+
+Источники: [спецификация OpenDota API](https://api.opendota.com/api),
+[режимы игры OpenDota](https://github.com/odota/dotaconstants/blob/master/json/game_mode.json),
+[асинхронный клиент httpx](https://www.python-httpx.org/async/).
