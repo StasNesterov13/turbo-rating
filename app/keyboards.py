@@ -1,4 +1,4 @@
-"""Persistent reply keyboard for the main bot actions."""
+"""Reply and inline keyboards for the main bot actions."""
 
 from aiogram.types import (
     InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup,
@@ -14,12 +14,15 @@ PROFILE_BUTTON = "👤 Профиль"
 LINK_BUTTON = "➕ Привязать Dota"
 CHANGE_BUTTON = "🔁 Сменить Dota"
 SHARE_BUTTON = "🔗 Поделиться"
-HISTORY_BUTTON = "📈 История TR"
+HISTORY_BUTTON = "📈 История"
 PRIZES_BUTTON = "💰 Призы"
 CHANGE_CONFIRM_PREFIX = "dota_change:confirm:"
 CHANGE_CANCEL_PREFIX = "dota_change:cancel:"
 VIEW_TOP_BUTTON = "🥇 Посмотреть топ"
 RATING_HELP_BUTTON = "ℹ️ Как считается рейтинг"
+FRIEND_CODE_HELP_CALLBACK = "dota_link:friend_code"
+MATCH_HISTORY_HELP_CALLBACK = "dota_link:match_history"
+LINK_RETRY_PREFIX = "dota_link:retry:"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
@@ -48,11 +51,26 @@ def get_main_keyboard(linked: bool) -> ReplyKeyboardMarkup:
     return MAIN_KEYBOARD if linked else UNLINKED_KEYBOARD
 
 
-def get_change_keyboard(token: str, *, confirm: bool = False) -> InlineKeyboardMarkup:
-    rows = []
-    if confirm:
-        rows.append([InlineKeyboardButton(
-            text="Сменить аккаунт", callback_data=CHANGE_CONFIRM_PREFIX + token,
-        )])
-    rows.append([InlineKeyboardButton(text="Отмена", callback_data=CHANGE_CANCEL_PREFIX + token)])
+def get_link_keyboard(
+    *, retry_token: str | None = None, change_token: str | None = None,
+) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton(text="🔎 Как найти код друга", callback_data=FRIEND_CODE_HELP_CALLBACK)],
+        [InlineKeyboardButton(text="⚙️ Как открыть историю матчей", callback_data=MATCH_HISTORY_HELP_CALLBACK)],
+    ]
+    if retry_token:
+        rows.append([InlineKeyboardButton(text="🔄 Проверить снова", callback_data=LINK_RETRY_PREFIX + retry_token)])
+    if change_token:
+        rows.append([InlineKeyboardButton(text="Отмена", callback_data=CHANGE_CANCEL_PREFIX + change_token)])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def get_change_keyboard(token: str, *, confirm: bool = False) -> InlineKeyboardMarkup:
+    if not confirm:
+        return get_link_keyboard(change_token=token)
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text="Сменить аккаунт", callback_data=CHANGE_CONFIRM_PREFIX + token,
+        )],
+        [InlineKeyboardButton(text="Отмена", callback_data=CHANGE_CANCEL_PREFIX + token)],
+    ])

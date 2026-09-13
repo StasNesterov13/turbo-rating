@@ -24,9 +24,10 @@ from app.keyboards import (
     STATS_BUTTON, TOP_BUTTON, MATCHES_BUTTON, SYNC_BUTTON, PROFILE_BUTTON, LINK_BUTTON,
     VIEW_TOP_BUTTON, RATING_HELP_BUTTON,
     CHANGE_BUTTON, CHANGE_CONFIRM_PREFIX, CHANGE_CANCEL_PREFIX, get_change_keyboard,
+    get_link_keyboard, FRIEND_CODE_HELP_CALLBACK, MATCH_HISTORY_HELP_CALLBACK, LINK_RETRY_PREFIX,
     SHARE_BUTTON, HISTORY_BUTTON, PRIZES_BUTTON,
 )
-from app.services.accounts import InvalidDotaAccountError, link_dota_account
+from app.services.accounts import InvalidDotaAccountError, link_dota_account, parse_dota_account_id
 from app.services.heroes import load_heroes
 from app.services.sync import MatchHistoryUnavailable, sync_player
 from app.services.rating import initialize_rating
@@ -44,10 +45,38 @@ _sync_in_progress: set[int] = set()
 OPENDOTA_ERROR_MESSAGE = "OpenDota временно недоступен. Попробуйте позже."
 HISTORY_UNAVAILABLE_MESSAGE = "Не удалось получить историю матчей.\nВключите Expose Public Match Data в Dota 2."
 ADD_ACCOUNT_MESSAGE = "Сначала привяжите Dota-профиль."
-LINK_PROMPT = "Привязка Dota\n\nОтправьте Friend ID или ссылку на профиль.\n\nНапример:\n165682118"
-CHANGE_PROMPT = "Смена Dota-профиля\n\nОтправьте новый Friend ID или ссылку на профиль."
+LINK_PROMPT = (
+    "<b>Подключение Dota 2</b>\n\n"
+    "Чтобы бот мог находить твои матчи:\n\n"
+    "1. Отправь свой код друга из Steam.\n"
+    "2. В Dota 2 включи <code>Общедоступная история матчей</code>.\n\n"
+    "Если включил её только что, нужно немного подождать, пока данные обновятся."
+)
+FRIEND_CODE_HELP_MESSAGE = (
+    "<b>Как найти код друга в Steam</b>\n\n"
+    "1. Открой Steam.\n"
+    "2. Перейди в раздел <code>Друзья</code>.\n"
+    "3. Выбери <code>Добавить друга</code>.\n"
+    "4. Найди свой <code>Код друга</code>.\n"
+    "5. Скопируй цифры и отправь их боту.\n\n"
+    "Нужен именно код друга Steam, а не ник или ссылка на профиль."
+)
+MATCH_HISTORY_HELP_MESSAGE = (
+    "<b>Как открыть историю матчей в Dota 2</b>\n\n"
+    "1. Открой Dota 2.\n"
+    "2. Нажми <code>Настройки</code> (шестерёнка).\n"
+    "3. Перейди в раздел <code>Сообщество</code>.\n"
+    "4. Включи <code>Общедоступная история матчей</code>.\n\n"
+    "⏳ Если ты только что включил «Общедоступную историю матчей», данные обновятся не сразу. "
+    "Подожди некоторое время и попробуй снова."
+)
+ACCOUNT_UNAVAILABLE_MESSAGE = (
+    "Пока не удалось получить данные аккаунта. Проверь, включена ли в Dota 2 "
+    "«Общедоступная история матчей». Если включил её только что — подожди немного и попробуй снова."
+)
+CHANGE_PROMPT = "Смена Dota-профиля\n\nОтправь новый код друга из Steam.\nВ Dota 2 включи «Общедоступная история матчей»."
 CHANGE_CANCELLED_MESSAGE = "Смена аккаунта отменена."
-INVALID_ACCOUNT_MESSAGE = "Не удалось определить Dota аккаунт.\n\nОтправьте Friend ID, например:\n165682118"
+INVALID_ACCOUNT_MESSAGE = "Не удалось определить Dota аккаунт.\n\nОтправь код друга Steam — только цифры, например:\n165682118"
 ONBOARDING_MESSAGE = (
     "🏆 Turbo Rating\n\n"
     "Рейтинг Turbo-игр среди друзей.\n\n"
@@ -79,7 +108,7 @@ BOT_COMMANDS = [
     BotCommand(command="start", description="Начать работу"),
     BotCommand(command="add", description="Подключить Dota аккаунт"),
     BotCommand(command="rating", description="Мой рейтинг"),
-    BotCommand(command="history", description="История TR и движение в топе"),
+    BotCommand(command="history", description="История и движение в топе"),
     BotCommand(command="top", description="Таблица лидеров"),
     BotCommand(command="prizes", description="Призы сезона"),
     BotCommand(command="matches", description="Последние матчи"),
@@ -187,8 +216,44 @@ async def link_command(message: Message, state: FSMContext) -> None:
     if _player(message) is not None:
         await change_command(message, state)
         return
+    await state.clear()
     await state.set_state(LinkDota.waiting_for_account)
-    await message.answer(LINK_PROMPT, reply_markup=get_main_keyboard(_player(message) is not None))
+    await message.answer(LINK_PROMPT, parse_mode="HTML", reply_markup=get_link_keyboard())
+
+
+@router.callback_query(F.data.in_({FRIEND_CODE_HELP_CALLBACK, MATCH_HISTORY_HELP_CALLBACK}))
+async def link_help_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    if not isinstance(callback.message, Message):
+        return
+    data = await state.get_data()
+    text = FRIEND_CODE_HELP_MESSAGE if callback.data == FRIEND_CODE_HELP_CALLBACK else MATCH_HISTORY_HELP_MESSAGE
+    await callback.message.answer(
+        text, parse_mode="HTML",
+        reply_markup=get_link_keyboard(
+            retry_token=data.get("retry_token"), change_token=data.get("change_token"),
+        ),
+    )
+
+
+@router.callback_query(F.data.startswith(LINK_RETRY_PREFIX))
+async def retry_link_callback(callback: CallbackQuery, state: FSMContext, api_key: str | None = None) -> None:
+    current = await state.get_state()
+    data = await state.get_data()
+    token = data.get("retry_token")
+    if not (
+        current in (LinkDota.waiting_for_account.state, ChangeDota.waiting_for_account.state)
+        and token and callback.data == LINK_RETRY_PREFIX + token
+        and data.get("pending_account_id") is not None
+        and isinstance(callback.message, Message)
+    ):
+        await callback.answer("Эта проверка уже недоступна. Открой подключение Dota 2 и отправь код друга снова.")
+        return
+    await callback.answer()
+    await _connect_account(
+        callback.message, str(data["pending_account_id"]), api_key, state,
+        telegram_id=callback.from_user.id,
+    )
 
 
 @router.message(F.text == CHANGE_BUTTON)
@@ -258,33 +323,44 @@ async def add_command(
         await state.set_data({"change_token": uuid4().hex} if linked else {})
         await state.set_state(ChangeDota.waiting_for_account if linked else LinkDota.waiting_for_account)
     if not command.args:
-        await message.answer(CHANGE_PROMPT if linked else LINK_PROMPT, reply_markup=get_main_keyboard(linked))
+        await message.answer(
+            CHANGE_PROMPT if linked else LINK_PROMPT, parse_mode="HTML", reply_markup=get_link_keyboard(),
+        )
         return
     await _connect_account(message, command.args, api_key, state)
 
 
 async def _connect_account(
     message: Message, text: str, api_key: str | None, state: FSMContext | None,
+    *, telegram_id: int | None = None,
 ) -> None:
-    if message.from_user is None:
+    if telegram_id is None and message.from_user is not None:
+        telegram_id = message.from_user.id
+    if telegram_id is None:
         return
     data = await state.get_data() if state is not None else {}
     token = data.get("change_token")
-    error_markup = get_change_keyboard(token) if token else None
+    account_id = parse_dota_account_id(text)
+    retry_token = uuid4().hex if state is not None and account_id is not None else None
+    if state is not None:
+        await state.update_data(pending_account_id=account_id, retry_token=retry_token)
+    error_markup = get_link_keyboard(retry_token=retry_token, change_token=token)
 
     try:
-        result = await link_dota_account(message.from_user.id, text, api_key=api_key)
+        result = await link_dota_account(telegram_id, text, api_key=api_key)
     except InvalidDotaAccountError:
         await message.answer(INVALID_ACCOUNT_MESSAGE, reply_markup=error_markup)
         return
     except (httpx.HTTPError, MatchHistoryUnavailable) as exc:
         error = _service_error(exc, OPENDOTA_ERROR_MESSAGE)
-        if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404:
-            error = "Профиль не найден. Проверьте Friend ID и отправьте ещё раз."
+        if isinstance(exc, MatchHistoryUnavailable) or (
+            isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code == 404
+        ):
+            error = ACCOUNT_UNAVAILABLE_MESSAGE
         await message.answer(error, reply_markup=error_markup)
         return
     except (ValueError, sqlite3.Error) as exc:
-        fallback = "Не удалось подключить профиль. Проверьте Friend ID и попробуйте ещё раз." if isinstance(exc, ValueError) else "Не удалось сохранить аккаунт и рейтинг. Попробуйте позже."
+        fallback = ACCOUNT_UNAVAILABLE_MESSAGE if isinstance(exc, ValueError) else "Не удалось сохранить аккаунт и рейтинг. Попробуйте позже."
         await message.answer(_service_error(exc, fallback), reply_markup=error_markup)
         return
 
@@ -486,7 +562,7 @@ async def account_input(message: Message, state: FSMContext, api_key: str | None
 
 @router.message(LinkDota.waiting_for_account)
 async def invalid_account_input(message: Message) -> None:
-    await message.answer(INVALID_ACCOUNT_MESSAGE)
+    await message.answer(INVALID_ACCOUNT_MESSAGE, reply_markup=get_link_keyboard())
 
 
 @router.message(ChangeDota.confirming)

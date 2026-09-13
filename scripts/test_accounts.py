@@ -1,4 +1,4 @@
-"""Offline account switching tests through Telegram dispatch and real SQLite."""
+"""Offline account connection and switching tests through Telegram dispatch and SQLite."""
 
 import asyncio
 from datetime import datetime, timezone
@@ -22,7 +22,10 @@ if __package__ in (None, ""):
 
 from app import db
 from app.autosync import sync_tracked_players
-from app.keyboards import CHANGE_BUTTON, LINK_BUTTON, MAIN_KEYBOARD, UNLINKED_KEYBOARD
+from app.keyboards import (
+    CHANGE_BUTTON, LINK_BUTTON, MAIN_KEYBOARD, UNLINKED_KEYBOARD,
+    FRIEND_CODE_HELP_CALLBACK, MATCH_HISTORY_HELP_CALLBACK,
+)
 from app.services.accounts import link_dota_account
 from app.services.opendota import OpenDotaClient
 from app.services.rating import apply_rating_changes, calculate_initial_rating
@@ -87,7 +90,8 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
             id="test-callback", chat_instance="local", data=data,
             from_user=User(id=user_id, is_bot=False, first_name="Test"),
             message=Message(message_id=2, date=datetime.now(timezone.utc),
-                            chat=Chat(id=chat_id or user_id, type="private" if chat_id is None else "group")),
+                            chat=Chat(id=chat_id or user_id, type="private" if chat_id is None else "group"),
+                            from_user=User(id=123456, is_bot=True, first_name="Bot")),
         )
         await self.dispatcher.feed_update(self.bot, Update(update_id=2, callback_query=callback))
         return [call.args[0] for call in self.outgoing.await_args_list]
@@ -100,6 +104,117 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(prompt.text, self.module.CHANGE_PROMPT)
         self.assertEqual(await self.context().get_state(), self.module.ChangeDota.waiting_for_account.state)
         return prompt
+
+    def retry_data(self, response):
+        return next(button.callback_data for row in response.reply_markup.inline_keyboard for button in row
+                    if button.text == "🔄 Проверить снова")
+
+    async def test_connection_help_keeps_input_active_without_database_or_api_changes(self):
+        before = self.snapshot()
+        for command in (LINK_BUTTON, "/add"):
+            prompt = (await self.send(command, user_id=202))[0]
+            self.assertEqual(prompt.text, self.module.LINK_PROMPT)
+            self.assertEqual(prompt.parse_mode, "HTML")
+            self.assertEqual([button.text for row in prompt.reply_markup.inline_keyboard for button in row],
+                             ["🔎 Как найти код друга", "⚙️ Как открыть историю матчей"])
+            for callback_data, expected in (
+                (FRIEND_CODE_HELP_CALLBACK, self.module.FRIEND_CODE_HELP_MESSAGE),
+                (MATCH_HISTORY_HELP_CALLBACK, self.module.MATCH_HISTORY_HELP_MESSAGE),
+            ):
+                replies = await self.click(callback_data, user_id=202)
+                self.assertIsInstance(replies[0], AnswerCallbackQuery)
+                self.assertEqual(replies[-1].text, expected)
+                self.assertEqual(replies[-1].parse_mode, "HTML")
+                self.assertEqual(await self.context(202).get_state(), self.module.LinkDota.waiting_for_account.state)
+        self.assertEqual(self.snapshot(), before)
+        self.profile.assert_not_awaited()
+        self.history.assert_not_awaited()
+        self.assertIn("Готово", (await self.send("43", user_id=202))[0].text)
+
+    async def test_retry_waits_for_public_data_and_connects_the_callback_user(self):
+        before = self.snapshot()
+        self.profile.side_effect = None
+        for payload in ({}, {"profile": None}, {"profile": {"account_id": 999}},
+                        {"profile": {"account_id": 43, "fh_unavailable": True}}):
+            with self.subTest(payload=payload):
+                self.profile.return_value = payload
+                response = (await self.send("/add 43", user_id=202))[0]
+                self.assertEqual(response.text, self.module.ACCOUNT_UNAVAILABLE_MESSAGE)
+                response = (await self.click(self.retry_data(response), user_id=202))[-1]
+                self.assertEqual(response.text, self.module.ACCOUNT_UNAVAILABLE_MESSAGE)
+                self.profile.assert_awaited_with(43)
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(await self.context(202).get_state(), self.module.LinkDota.waiting_for_account.state)
+
+        retry = self.retry_data(response)
+        pending = await self.context(202).get_data()
+        help_response = (await self.click(MATCH_HISTORY_HELP_CALLBACK, user_id=202))[-1]
+        self.assertEqual(self.retry_data(help_response), retry)
+        self.assertEqual(await self.context(202).get_data(), pending)
+        self.profile.return_value = {"profile": {"account_id": 43, "personaname": "New Player"}}
+        response = (await self.click(retry, user_id=202))[-1]
+        self.assertIn("Готово", response.text)
+        self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
+        self.assertEqual(db.get_telegram_player(202)["account_id"], 43)
+        self.assertEqual(db.get_telegram_player(201)["account_id"], 42)
+        self.assertIsNone(await self.context(202).get_state())
+        self.assertEqual(await self.context(202).get_data(), {})
+        self.history.assert_awaited_once()
+
+        linked = self.snapshot()
+        self.profile.reset_mock()
+        replies = await self.click(retry, user_id=202)
+        self.assertEqual(len(replies), 1)
+        self.assertIsInstance(replies[0], AnswerCallbackQuery)
+        self.profile.assert_not_awaited()
+        self.assertEqual(self.snapshot(), linked)
+
+    async def test_retry_buttons_are_scoped_to_current_input_user_and_chat(self):
+        self.profile.side_effect = httpx.ReadTimeout("private-url")
+        before = self.snapshot()
+        response = (await self.send("/add 43", user_id=202))[0]
+        retry = self.retry_data(response)
+        await self.send("/add 44", user_id=203)
+        await self.send("/add 45", user_id=202, chat_id=-100)
+        self.profile.reset_mock()
+        for user_id, chat_id in ((203, None), (202, -100)):
+            replies = await self.click(retry, user_id=user_id, chat_id=chat_id)
+            self.assertEqual(len(replies), 1)
+            self.assertIsInstance(replies[0], AnswerCallbackQuery)
+        self.profile.assert_not_awaited()
+
+        for next_input in ("/start", LINK_BUTTON, "/add", "44", "bad"):
+            with self.subTest(next_input=next_input):
+                response = (await self.send("/add 43", user_id=202))[0]
+                await self.send(next_input, user_id=202)
+                self.profile.reset_mock()
+                pending = await self.context(202).get_data()
+                replies = await self.click(self.retry_data(response), user_id=202)
+                self.assertEqual(len(replies), 1)
+                self.assertIsInstance(replies[0], AnswerCallbackQuery)
+                self.profile.assert_not_awaited()
+                self.assertEqual(await self.context(202).get_data(), pending)
+        self.assertEqual(self.snapshot(), before)
+
+    async def test_retry_after_missing_profile_can_be_cancelled_during_account_change(self):
+        before = self.snapshot()
+        request = httpx.Request("GET", "https://example.test/profile")
+        self.profile.side_effect = httpx.HTTPStatusError(
+            "private-url", request=request, response=httpx.Response(404, request=request),
+        )
+        await self.begin_change()
+        response = (await self.send("43"))[0]
+        self.assertEqual(response.text, self.module.ACCOUNT_UNAVAILABLE_MESSAGE)
+        retry = self.retry_data(response)
+        help_response = (await self.click(FRIEND_CODE_HELP_CALLBACK))[-1]
+        cancel = help_response.reply_markup.inline_keyboard[-1][0]
+        self.assertEqual(cancel.text, "Отмена")
+        await self.click(cancel.callback_data)
+        self.profile.reset_mock()
+        await self.click(retry)
+        self.profile.assert_not_awaited()
+        self.assertIsNone(await self.context().get_state())
+        self.assertEqual(self.snapshot(), before)
 
     async def test_menu_and_confirmation_do_not_mutate_database(self):
         before = self.snapshot()
@@ -190,7 +305,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.profile.side_effect = None
         for payload in ({}, {"profile": None}, {"profile": {"account_id": 999}}):
             self.profile.return_value = payload
-            self.assertIn("Проверьте Friend ID", (await self.send("43"))[0].text)
+            self.assertEqual((await self.send("43"))[0].text, self.module.ACCOUNT_UNAVAILABLE_MESSAGE)
             self.assertEqual(self.snapshot(), before)
         self.profile.return_value = {"profile": {"account_id": 43, "personaname": "New Player"}}
         self.assertIn("Теперь подключён:", (await self.send("43"))[0].text)
@@ -251,14 +366,15 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         old = self.player_snapshot(42)
         self.history.side_effect = httpx.ReadTimeout("private-url")
         await self.begin_change()
-        self.assertIn("Попробуйте позже", (await self.send("43"))[0].text)
+        response = (await self.send("43"))[0]
+        self.assertIn("Попробуйте позже", response.text)
         self.assertEqual(db.get_telegram_player(201)["account_id"], 42)
         self.assertIsNone(db.get_rating(43))
         self.assertEqual(db.get_player_matches(43, include_calibration=True), [])
         self.assertEqual(db.get_tracked_account_ids(), [42])
         tracking = db.get_player(43)["tracking_started_at"]
         self.history.side_effect = None
-        self.assertIn("Готово", (await self.send("43"))[0].text)
+        self.assertIn("Готово", (await self.click(self.retry_data(response)))[-1].text)
         self.assertEqual(db.get_player(43)["tracking_started_at"], tracking)
         self.assertEqual(self.player_snapshot(42), old)
 
