@@ -21,6 +21,7 @@ from app import db
 from app.autosync import run_autosync, sync_tracked_players
 from app.notifications import format_rating_updates, notify_rating_updates
 from app.services.opendota import OpenDotaClient
+from app.services import sync as sync_service
 from app.services.sync import RatingUpdate, SyncResult, sync_player
 from scripts.test_rating import match
 
@@ -37,23 +38,93 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         self.fetch = self.enterContext(patch.object(
             OpenDotaClient, "get_matches_for_sync", new=AsyncMock(return_value=[])
         ))
+        self.profile = self.enterContext(patch.object(OpenDotaClient, "get_player", new=AsyncMock(
+            side_effect=lambda account_id: {"profile": {
+                "account_id": account_id, "personaname": db.get_player(account_id)["nickname"],
+            }},
+        )))
+        self.enterContext(patch.object(sync_service, "_last_sync_times", {}))
         self.bot = AsyncMock(spec=Bot)
 
     def player(self, account_id, rating=1000):
         db.add_player(account_id, f"Player {account_id}", 1000)
         db.create_rating(account_id, float(rating), [], 0)
 
+    async def test_successful_empty_sync_refreshes_name_and_time_only(self):
+        self.player(42)
+        player, rating = db.get_player(42), db.get_rating(42)
+        self.profile.side_effect = None
+        self.profile.return_value = {"profile": {"account_id": 42, "personaname": "Renamed"}}
+        with patch.object(sync_service.time, "time", return_value=1704067200):
+            result = await sync_player(42)
+        self.assertEqual(result.rating_updates, [])
+        self.assertEqual(db.get_player(42), {**player, "nickname": "Renamed"})
+        self.assertEqual(db.get_rating(42), rating)
+        self.assertEqual(db.get_rating_history(42), [])
+        self.assertEqual(sync_service.get_last_sync_time(42), 1704067200)
+        self.profile.assert_awaited_once_with(42)
+        await sync_player(42)
+        self.assertEqual(db.get_player(42), {**player, "nickname": "Renamed"})
+
+    async def test_failed_sync_preserves_name_rating_and_last_success_time(self):
+        self.player(42)
+        player, rating = db.get_player(42), db.get_rating(42)
+        sync_service._last_sync_times[42] = 1234
+        self.profile.side_effect = None
+        self.profile.return_value = {"profile": {"account_id": 42, "personaname": "Not saved"}}
+        self.fetch.side_effect = httpx.ReadTimeout("private-key")
+        with self.assertRaises(httpx.ReadTimeout), self.assertLogs("app.services.sync", level="ERROR"):
+            await sync_player(42)
+        self.assertEqual(db.get_player(42), player)
+        self.assertEqual(db.get_rating(42), rating)
+        self.assertEqual(sync_service.get_last_sync_time(42), 1234)
+
+    async def test_explicit_private_history_is_distinct_from_empty_history(self):
+        self.player(42)
+        player, rating = db.get_player(42), db.get_rating(42)
+        self.profile.side_effect = None
+        self.profile.return_value = {"profile": {"account_id": 42, "personaname": "Private", "fh_unavailable": True}}
+        with self.assertRaises(sync_service.MatchHistoryUnavailable), self.assertLogs("app.services.sync", level="ERROR"):
+            await sync_player(42)
+        self.fetch.assert_not_awaited()
+        self.assertEqual(db.get_player(42), player)
+        self.assertEqual(db.get_rating(42), rating)
+        self.assertIsNone(sync_service.get_last_sync_time(42))
+        self.profile.return_value["profile"]["fh_unavailable"] = False
+        result = await sync_player(42)
+        self.assertEqual(result.new_count, 0)
+        self.assertIsNotNone(sync_service.get_last_sync_time(42))
+        self.profile.return_value = {"profile": {"account_id": 43, "fh_unavailable": True}}
+        with self.assertRaises(sync_service.MatchHistoryUnavailable):
+            await sync_service.ensure_player(43)
+        self.assertIsNone(db.get_player(43))
+
+    async def test_autosync_ignores_manual_user_cooldown(self):
+        from app import bot as bot_module
+        self.player(42)
+        db.link_telegram_user(101, 42)
+        self.enterContext(patch.object(bot_module, "_sync_cooldowns", {}))
+        message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
+        await bot_module.sync_command(message)
+        await bot_module.sync_command(message)
+        self.assertIn("Данные недавно обновлялись", message.answer.await_args.args[0])
+        self.fetch.assert_awaited_once()
+        await sync_tracked_players(self.bot)
+        self.assertEqual(self.fetch.await_count, 2)
+
     async def test_leaderboard_unique_stable_sorted_and_limited(self):
         for account_id, rating in ((42, 1000), (43, 1200), (44, 1000)):
             self.player(account_id, rating)
+            db.link_telegram_user(1000 + account_id, account_id)
         db.add_player(45, "No rating", 1000)
         db.link_telegram_user(101, 42)
         db.link_telegram_user(102, 42)
         self.assertEqual([p["account_id"] for p in db.get_leaderboard()], [43, 42, 44])
-        self.assertEqual(db.get_tracked_account_ids(), [42])
-        self.assertEqual(db.get_telegram_ids_by_account(42), [101, 102])
+        self.assertEqual(db.get_tracked_account_ids(), [42, 43, 44])
+        self.assertEqual(db.get_telegram_ids_by_account(42), [101, 102, 1042])
         for account_id in range(100, 125):
             self.player(account_id, 900)
+            db.link_telegram_user(1000 + account_id, account_id)
         self.assertEqual(len(db.get_leaderboard(limit=100)), 20)
         self.assertEqual(len(db.get_leaderboard(limit=2)), 2)
 
@@ -209,8 +280,8 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_notification_formats_and_bounded_message_length(self):
         win = RatingUpdate(1, 1001, 44, True, 1000, 16, 1016)
         loss = RatingUpdate(2, 1002, 14, False, 1016, -16.73630679352, 999.26369320648)
-        self.assertIn("🟢 Победа в Turbo", format_rating_updates([win]))
-        self.assertIn("🔴 Поражение в Turbo", format_rating_updates([loss]))
+        self.assertIn("🟢 Победа ·", format_rating_updates([win]))
+        self.assertIn("🔴 Поражение ·", format_rating_updates([loss]))
         self.assertIn("Hero #44", format_rating_updates([win]))
         self.assertIn("🟢 Turbo WIN: Hero #44  +16 TR", format_rating_updates([win, loss], manual=True))
         self.assertIn("Rating: 1000 → 999", format_rating_updates([win, loss]))
@@ -219,6 +290,8 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_top_add_and_manual_sync_responses(self):
         from aiogram.filters import CommandObject
+        self.enterContext(patch("app.bot.MANUAL_SYNC_COOLDOWN", 0))
+        self.enterContext(patch("app.bot._sync_cooldowns", {}))
         from app.bot import add_command, top_command, sync_command
 
         message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
@@ -236,6 +309,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
             self.history.assert_awaited_once()
         db.link_telegram_user(102, 42)
         self.player(43, 1200)
+        db.link_telegram_user(103, 43)
         message.answer.reset_mock()
         await top_command(message)
         self.assertEqual(message.answer.await_args.args[0], "🥇 Turbo Rating\n\n🥇 Player 43 — 1200\n🥈 Test Player — 1000 ← вы")
@@ -268,7 +342,9 @@ class RestartPaginationTests(unittest.IsolatedAsyncioTestCase):
                 async def page(account_id, limit, offset=0):
                     return data[offset:offset + limit]
 
-                with patch.object(OpenDotaClient, "get_recent_matches", new=AsyncMock(side_effect=page)) as fetch:
+                with patch.object(OpenDotaClient, "get_player", new=AsyncMock(return_value={
+                    "profile": {"account_id": 42, "personaname": "Restart"},
+                })), patch.object(OpenDotaClient, "get_recent_matches", new=AsyncMock(side_effect=page)) as fetch:
                     result = await sync_player(42)
                     self.assertEqual([c.kwargs["offset"] for c in fetch.await_args_list], [0, 50, 100])
                     self.assertEqual(len(result.rating_updates), 121)

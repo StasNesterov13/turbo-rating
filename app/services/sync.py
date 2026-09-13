@@ -16,6 +16,25 @@ from app.services.rating import initialize_rating, apply_rating_changes
 logger = logging.getLogger(__name__)
 # Waiting/running calls keep a strong reference; idle locks can be released.
 _sync_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
+# Display-only timestamps; a restart waits for the next successful sync.
+_last_sync_times: dict[int, float] = {}
+
+
+class MatchHistoryUnavailable(ValueError):
+    """OpenDota explicitly reports that the player's history is unavailable."""
+
+
+def get_last_sync_time(account_id: int) -> float | None:
+    return _last_sync_times.get(account_id)
+
+
+def _player_profile(player_data: dict[str, Any], account_id: int) -> dict[str, Any]:
+    profile = player_data.get("profile")
+    if not isinstance(profile, dict) or profile.get("account_id") != account_id:
+        raise ValueError("Игрок не найден в OpenDota. Проверьте Dota ID.")
+    if profile.get("fh_unavailable") is True:
+        raise MatchHistoryUnavailable("OpenDota profile has fh_unavailable=true")
+    return profile
 
 
 @dataclass(frozen=True)
@@ -51,9 +70,7 @@ async def ensure_player(
         api_key=api_key if api_key is not None else os.getenv("OPENDOTA_API_KEY") or None
     ) as client:
         player_data = await client.get_player(account_id)
-    profile = player_data.get("profile")
-    if not isinstance(profile, dict) or profile.get("account_id") != account_id:
-        raise ValueError("Игрок не найден в OpenDota. Проверьте Dota ID.")
+    profile = _player_profile(player_data, account_id)
     db.add_player(account_id, profile.get("personaname"), int(time.time()))
     await initialize_rating(account_id, api_key=api_key)
     return profile
@@ -81,11 +98,11 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
     player = db.get_player(account_id)
     if player is None:
         raise ValueError("Игрок ещё не добавлен в БД.")
-    await initialize_rating(account_id, api_key=api_key)
-
     async with OpenDotaClient(
         api_key=api_key if api_key is not None else os.getenv("OPENDOTA_API_KEY") or None
     ) as client:
+        profile = _player_profile(await client.get_player(account_id), account_id)
+        await initialize_rating(account_id, api_key=api_key)
         matches = await client.get_matches_for_sync(account_id, player["tracking_started_at"])
 
     for match in matches:
@@ -117,6 +134,10 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
             rating_after=change["rating_after"],
         ) for change in rating_changes
     ]
+    nickname = profile.get("personaname")
+    if isinstance(nickname, str) and nickname.strip():
+        db.update_player_nickname(account_id, nickname)
+    _last_sync_times[account_id] = time.time()
     return SyncResult(
         received_count=len(matches),
         new_matches=new_matches,

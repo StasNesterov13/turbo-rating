@@ -112,6 +112,14 @@ def get_player(account_id: int) -> dict[str, Any] | None:
     return dict(row) if row is not None else None
 
 
+def update_player_nickname(account_id: int, nickname: str) -> None:
+    with _connect() as connection:
+        connection.execute(
+            "UPDATE players SET nickname = ? WHERE account_id = ? AND nickname IS NOT ?",
+            (nickname, account_id, nickname),
+        )
+
+
 def get_match_win(match: dict[str, Any]) -> bool | None:
     """Determine the player's result; incomplete results remain unknown."""
     player_slot = match.get("player_slot")
@@ -186,7 +194,7 @@ def get_player_matches(
 
 
 def link_telegram_user(telegram_id: int, account_id: int) -> None:
-    """Link one Dota account per Telegram user; repeated links are idempotent."""
+    """Atomically replace one user's link, preserving all player data."""
     with _connect() as connection:
         connection.execute(
             """
@@ -342,6 +350,9 @@ def get_leaderboard(limit: int = 20) -> list[dict[str, Any]]:
             """
             SELECT p.account_id, p.nickname, r.current_rating
             FROM ratings r JOIN players p ON p.account_id = r.account_id
+            WHERE EXISTS (
+                SELECT 1 FROM telegram_users t WHERE t.account_id = p.account_id
+            )
             ORDER BY r.current_rating DESC, p.account_id ASC LIMIT ?
             """,
             (min(limit, 20),),
@@ -383,17 +394,56 @@ def get_turbo_stats(account_id: int) -> dict[str, Any]:
     return stats
 
 
-def get_leaderboard_position(account_id: int) -> dict[str, Any] | None:
+def get_leaderboard_position(account_id: int, *, rating: float | None = None) -> dict[str, Any] | None:
+    """Rank an active player, optionally at another rating without changing it."""
     with _connect() as connection:
         row = connection.execute(
             """
+            WITH subject AS (
+                SELECT account_id, COALESCE(?, current_rating) AS current_rating
+                FROM ratings WHERE account_id = ?
+            )
             SELECT r.account_id, r.current_rating,
                 1 + (SELECT COUNT(*) FROM ratings other
-                     WHERE other.current_rating > r.current_rating
+                     WHERE other.account_id <> r.account_id
+                       AND (other.current_rating > r.current_rating
                         OR (other.current_rating = r.current_rating
-                            AND other.account_id < r.account_id)) AS position
-            FROM ratings r WHERE r.account_id = ?
+                            AND other.account_id < r.account_id))
+                       AND EXISTS (SELECT 1 FROM telegram_users t
+                                   WHERE t.account_id = other.account_id)) AS position
+            FROM subject r
+            WHERE EXISTS (SELECT 1 FROM telegram_users t
+                          WHERE t.account_id = r.account_id)
             """,
-            (account_id,),
+            (rating, account_id),
         ).fetchone()
     return dict(row) if row is not None else None
+
+
+def get_turbo_form(account_id: int) -> dict[str, Any]:
+    """Recent completed Turbo results and the full current streak, newest first."""
+    results = []
+    streak = 0
+    streak_win = None
+    continuing = True
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT m.win FROM matches m JOIN players p ON p.account_id = m.account_id
+            WHERE m.account_id = ? AND m.game_mode = 23 AND m.is_calibration = 0
+                AND m.start_time >= p.tracking_started_at AND m.win IS NOT NULL
+            ORDER BY m.start_time DESC, m.match_id DESC
+            """, (account_id,),
+        )
+        for row in rows:
+            win = bool(row["win"])
+            if streak_win is None:
+                streak_win = win
+            if len(results) < 5:
+                results.append("W" if win else "L")
+            continuing = continuing and win == streak_win
+            if continuing:
+                streak += 1
+            elif len(results) == 5:
+                break
+    return {"results": results, "streak": streak, "streak_win": streak_win}

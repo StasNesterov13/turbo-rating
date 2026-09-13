@@ -4,6 +4,7 @@ import asyncio
 from datetime import datetime, timezone
 import importlib
 from pathlib import Path
+import sqlite3
 import sys
 import tempfile
 from types import SimpleNamespace
@@ -20,10 +21,10 @@ if __package__ in (None, ""):
 
 from app import db
 from app.keyboards import (
-    MAIN_KEYBOARD, UNLINKED_KEYBOARD, LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON,
+    MAIN_KEYBOARD, UNLINKED_KEYBOARD, LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON, CHANGE_BUTTON, SHARE_BUTTON,
 )
-from app.notifications import format_rating_updates
-from app.services import heroes
+from app.notifications import format_rating_updates, notify_rating_updates
+from app.services import heroes, sync as sync_service
 from app.services.game_modes import get_game_mode_name
 from app.services.accounts import parse_dota_account_id
 from app.services.opendota import OpenDotaClient
@@ -107,16 +108,159 @@ class HeroTests(unittest.IsolatedAsyncioTestCase):
 
 class UXTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        from app import bot as bot_module
         temporary = tempfile.TemporaryDirectory(prefix="turbo-ux-test-")
         self.addCleanup(temporary.cleanup)
         self.enterContext(patch.object(db, "DB_PATH", Path(temporary.name) / "test.db"))
         self.enterContext(patch.object(heroes, "_hero_names", {
             44: "Phantom Assassin", 14: "Pudge", 35: "Sniper",
         }))
+        self.enterContext(patch.object(sync_service, "_last_sync_times", {}))
+        self.enterContext(patch.object(bot_module, "_sync_cooldowns", {}))
+        self.enterContext(patch.object(bot_module, "_sync_in_progress", set()))
         db.init_db()
         db.add_player(42, "Test Player", 1000)
         db.create_rating(42, 1000, [], 0)
         db.link_telegram_user(101, 42)
+
+    async def test_home_and_rating_show_form_and_streak_without_changing_rating(self):
+        from app.bot import start_command, rating_command
+        for index, win in enumerate((False, True, False, True, True, True), 1):
+            db.save_match(42, match(index, 1000 + index, win))
+        db.save_match(42, match(7, 1100, False, game_mode=1))
+        db.save_match(42, match(8, 1200, False), is_calibration=True)
+        db.save_match(42, match(9, 999, False))
+        unknown = match(10, 1300)
+        unknown["radiant_win"] = None
+        db.save_match(42, unknown)
+        before = db.get_rating(42), db.get_rating_history(42)
+        sync_service._last_sync_times[42] = 1704067200
+        message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
+        await start_command(message)
+        text = message.answer.await_args.args[0]
+        self.assertEqual(text,
+                         "🏆 Turbo Rating\n\nTest Player\n1000 TR · место #1\n\n"
+                         "7 Turbo · 66.7% WR\n\nПоследние:\nW W W L W\n\nОбновлено: 01.01 00:00 UTC")
+        self.assertEqual(message.answer.await_args.kwargs["reply_markup"], MAIN_KEYBOARD)
+        await rating_command(message)
+        text = message.answer.await_args.args[0]
+        self.assertIn("Последние:\nW W W L W\n\nСерия: 3 победы", text)
+        self.assertEqual((db.get_rating(42), db.get_rating_history(42)), before)
+
+    async def test_empty_form_losses_and_streak_longer_than_five(self):
+        from app.bot import start_command, rating_command
+        message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
+        await start_command(message)
+        self.assertIn("0 Turbo · 0.0% WR", message.answer.await_args.args[0])
+        self.assertIn("Обновлено: ожидаем обновления", message.answer.await_args.args[0])
+        await rating_command(message)
+        self.assertIn("Серия: пока нет", message.answer.await_args.args[0])
+        for index in range(1, 8):
+            db.save_match(42, match(index, 1000 + index))
+        await rating_command(message)
+        self.assertIn("Последние:\nW W W W W\n\nСерия: 7 побед", message.answer.await_args.args[0])
+        # Equal start times are resolved by match_id, just like rating history.
+        for index in (8, 9):
+            db.save_match(42, match(index, 1007, False))
+        await rating_command(message)
+        self.assertIn("Последние:\nL L W W W\n\nСерия: 2 поражения", message.answer.await_args.args[0])
+
+    async def test_manual_cooldown_is_per_telegram_user_across_chats(self):
+        from app import bot as bot_module
+        db.link_telegram_user(102, 42)
+        message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
+        other_chat = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
+        other_user = SimpleNamespace(from_user=SimpleNamespace(id=102), answer=AsyncMock())
+        with patch.object(bot_module, "monotonic", return_value=100) as clock, patch.object(
+            bot_module, "sync_player", new=AsyncMock(return_value=SyncResult(0, []))
+        ) as sync:
+            await bot_module.sync_command(message)
+            clock.return_value = 115.2
+            await bot_module.sync_command(other_chat)
+            self.assertEqual(other_chat.answer.await_args.args[0],
+                             "Данные недавно обновлялись.\nПопробуйте через 15 сек.")
+            sync.assert_awaited_once()
+            await bot_module.sync_command(other_user)
+            self.assertEqual(sync.await_count, 2)
+            clock.return_value = 130
+            await bot_module.sync_command(message)
+            self.assertEqual(sync.await_count, 3)
+
+    async def test_sync_errors_are_friendly_logged_and_allow_immediate_retry(self):
+        from app import bot as bot_module
+        message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
+        request = httpx.Request("GET", "https://example.test/?api_key=private-key")
+        failures = [
+            httpx.ReadTimeout("private-key"),
+            httpx.HTTPStatusError("private-key", request=request, response=httpx.Response(503, request=request)),
+            sync_service.MatchHistoryUnavailable("fh_unavailable=true"),
+            ValueError("malformed OpenDota history"), sqlite3.OperationalError("technical detail"),
+        ]
+        with patch.object(bot_module, "sync_player", new=AsyncMock()) as sync:
+            for failure in failures:
+                sync.side_effect = failure
+                with self.assertLogs("app.bot", level="ERROR") as logged:
+                    await bot_module.sync_command(message)
+                text = message.answer.await_args.args[0]
+                if isinstance(failure, sync_service.MatchHistoryUnavailable):
+                    self.assertEqual(text, bot_module.HISTORY_UNAVAILABLE_MESSAGE)
+                elif not isinstance(failure, sqlite3.Error):
+                    self.assertEqual(text, bot_module.OPENDOTA_ERROR_MESSAGE)
+                self.assertIn(type(failure).__name__, " ".join(logged.output))
+                for secret in ("private-key", "traceback", "503", "technical detail"):
+                    self.assertNotIn(secret, text)
+                self.assertNotIn("private-key", " ".join(logged.output))
+                self.assertNotIn(101, bot_module._sync_cooldowns)
+            sync.side_effect = None
+            sync.return_value = SyncResult(0, [])
+            await bot_module.sync_command(message)
+            self.assertIn("Данные актуальны", message.answer.await_args.args[0])
+
+    async def test_slow_sync_cannot_duplicate_and_cancellation_clears_cooldown(self):
+        from app import bot as bot_module
+        entered = asyncio.Event()
+
+        async def blocked(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
+        with patch.object(bot_module, "monotonic", return_value=100) as clock, patch.object(
+            bot_module, "sync_player", new=AsyncMock(side_effect=blocked)
+        ) as sync:
+            task = asyncio.create_task(bot_module.sync_command(message))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                clock.return_value = 140
+                await bot_module.sync_command(message)
+                self.assertIn("Обновление уже выполняется", message.answer.await_args.args[0])
+                sync.assert_awaited_once()
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            self.assertNotIn(101, bot_module._sync_in_progress)
+            self.assertNotIn(101, bot_module._sync_cooldowns)
+
+    async def test_notifications_show_moved_unchanged_and_tied_positions_read_only(self):
+        for account_id, rating in ((43, 1055), (44, 1100), (45, 1200)):
+            db.add_player(account_id, str(account_id), 1000)
+            db.create_rating(account_id, rating, [], 0)
+            db.link_telegram_user(account_id, account_id)
+        db.link_telegram_user(102, 43)  # Multiple subscribers cannot inflate rank.
+        db.add_player(46, "Inactive", 1000)
+        db.create_rating(46, 9000, [], 0)
+        with db._connect() as connection:
+            connection.execute("UPDATE ratings SET current_rating = 1070 WHERE account_id = 42")
+        before = db.get_rating(42), db.get_rating_history(42)
+        bot = AsyncMock(spec=Bot)
+        for start, end, position in ((1053, 1070, "#4 → #3"), (1050, 1053, "#4"),
+                                     (1053, 1055, "#4 → #3"), (1070, 1053, "#3 → #4")):
+            await notify_rating_updates(bot, 42, [RatingUpdate(1, 1001, 44, end > start, start, end - start, end)])
+            self.assertTrue(bot.send_message.await_args.args[1].endswith(f"Место: {position}"))
+        self.assertEqual((db.get_rating(42), db.get_rating_history(42)), before)
+        self.assertEqual(format_rating_updates(
+            [RatingUpdate(1, 1001, 44, True, 1053, 17, 1070)], position_before=4, position_after=3,
+        ), "🟢 Победа · Phantom Assassin\n\n+17 TR\n1053 → 1070\n\nМесто: #4 → #3")
 
     async def test_stats_only_turbo_since_tracking_without_calibration(self):
         for game in (match(1, 1000), match(2, 1001), match(3, 1002, False),
@@ -161,6 +305,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         for account_id in range(1, 27):
             db.add_player(account_id, f"Player {account_id}", 1000)
             db.create_rating(account_id, 1000, [], 0)
+            db.link_telegram_user(1000 + account_id, account_id)
         db.add_player(99, "Unrated", 1000)
         db.link_telegram_user(102, 42)
         self.assertEqual(db.get_leaderboard_position(42)["position"], 27)
@@ -168,7 +313,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["account_id"] for row in db.get_leaderboard()], list(range(1, 21)))
         message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
         await top_command(message)
-        self.assertIn("Ваше место:\n#27 — 1000", message.answer.await_args.args[0])
+        self.assertIn("Ваше место: #27 — 1000 TR", message.answer.await_args.args[0])
         db.link_telegram_user(101, 3)
         await top_command(message)
         self.assertIn("🥉 Player 3 — 1000 ← вы", message.answer.await_args.args[0])
@@ -177,6 +322,10 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         from app import bot as bot_module
         # Each integration suite needs its own unattached Router instance.
         importlib.reload(bot_module)
+        self.enterContext(patch.object(bot_module, "MANUAL_SYNC_COOLDOWN", 0))
+        self.enterContext(patch.object(Bot, "me", new=AsyncMock(return_value=User(
+            id=123456, is_bot=True, first_name="Turbo", username="turbo_rating_test_bot",
+        ))))
         dispatcher = Dispatcher()
         dispatcher.include_router(bot_module.router)
         for index in range(1, 7):
@@ -188,8 +337,8 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         sync_result = SyncResult(received_count=0, new_matches=[], rating_changes=[])
         async with Bot(token="123456:LOCAL_ONLY_TEST_TOKEN") as bot:
             with patch.object(Bot, "__call__", outgoing), patch.object(
-                bot_module, "ensure_player", new=AsyncMock(return_value={"personaname": "Test Player"})
-            ), patch.object(bot_module, "sync_player", new=AsyncMock(return_value=sync_result)) as sync:
+                bot_module, "sync_player", new=AsyncMock(return_value=sync_result)
+            ) as sync:
                 async def send(text, user_id=101):
                     outgoing.reset_mock()
                     message = Message(message_id=1, date=datetime.now(timezone.utc),
@@ -203,7 +352,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     response = await send(command)
                     self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
                 buttons = [button.text for row in MAIN_KEYBOARD.keyboard for button in row]
-                self.assertEqual(buttons, ["🏆 Мой рейтинг", "🥇 Топ игроков", "📊 Статистика", "🎮 Матчи", "🔄 Обновить", "👤 Профиль", RATING_HELP_BUTTON])
+                self.assertEqual(buttons, ["🏆 Мой рейтинг", "🥇 Топ игроков", "📊 Статистика", "🎮 Матчи", "🔄 Обновить", "👤 Профиль", CHANGE_BUTTON, SHARE_BUTTON, RATING_HELP_BUTTON])
                 for button, command in zip(buttons, ("/rating", "/top", "/stats", "/matches", "/sync", "/profile")):
                     self.assertEqual((await send(button)).text, (await send(command)).text)
                 self.assertEqual(sync.await_count, 2)
@@ -225,13 +374,17 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
                     self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
                 for button in buttons:
-                    if button in ("🥇 Топ игроков", RATING_HELP_BUTTON):
+                    if button in ("🥇 Топ игроков", RATING_HELP_BUTTON, SHARE_BUTTON):
                         continue
                     response = await send(button, user_id=999)
                     self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
                     self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
                 self.assertEqual((await send("🏆 Рейтинг")).text, (await send("/rating")).text)
                 self.assertEqual((await send("🥇 Топ")).text, (await send("/top")).text)
+                shared = await send(SHARE_BUTTON)
+                self.assertEqual(shared.text,
+                                 "🏆 Turbo Rating — рейтинг Turbo среди друзей.\nПрисоединяйся: https://t.me/turbo_rating_test_bot")
+                self.assertEqual(shared.reply_markup, MAIN_KEYBOARD)
         self.assertEqual([cmd.command for cmd in bot_module.BOT_COMMANDS],
                          ["start", "add", "rating", "stats", "top", "matches", "sync", "profile"])
 
@@ -239,9 +392,9 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         win = RatingUpdate(1, 1001, 44, True, 1000, 16, 1016)
         loss = RatingUpdate(2, 1002, 14, False, 1016, -17, 999)
         self.assertEqual(format_rating_updates([win]),
-                         "🟢 Победа в Turbo\n\nPhantom Assassin\n\n+16 TR\n1000 → 1016")
+                         "🟢 Победа · Phantom Assassin\n\n+16 TR\n1000 → 1016")
         self.assertEqual(format_rating_updates([loss]),
-                         "🔴 Поражение в Turbo\n\nPudge\n\n-17 TR\n1016 → 999")
+                         "🔴 Поражение · Pudge\n\n-17 TR\n1016 → 999")
         group = format_rating_updates([win, loss])
         self.assertIn("🟢 Phantom Assassin  +16 TR", group)
         self.assertIn("🔴 Pudge  -17 TR", group)
@@ -291,6 +444,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         db.init_db()
         db.add_player(42, "Leader", 1000)
         db.create_rating(42, 1200, [], 0)
+        db.link_telegram_user(101, 42)
         self.dispatcher = Dispatcher()
         self.dispatcher.include_router(self.module.router)
         self.addAsyncCleanup(self.dispatcher.storage.close)
@@ -352,8 +506,9 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
                 original = snapshot
             self.assertEqual(snapshot, original)
             repeat = await self.send("/start", user_id)
-            self.assertIn("Ваш рейтинг: 953\nМесто: #2", repeat.text)
-            self.assertIn("🥇 Leader — 1200", repeat.text)
+            self.assertIn("ДЕРЕВЕНСКИЙ\n953 TR · место #2", repeat.text)
+            self.assertIn("0 Turbo · 0.0% WR", repeat.text)
+            self.assertNotIn("Leader", repeat.text)
             self.assertNotIn("Как это работает:", repeat.text)
             self.assertNotIn("Привяжите", repeat.text)
             self.assertEqual(repeat.reply_markup, MAIN_KEYBOARD)
@@ -376,7 +531,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(registered.text, response.text)
         self.assertEqual(registered.reply_markup, MAIN_KEYBOARD)
         start = await self.send("/start")
-        self.assertIn("Ваш рейтинг: 1200", start.text)
+        self.assertIn("1200 TR · место #1", start.text)
         self.assertNotIn("Как это работает:", start.text)
         self.assertIn(RATING_HELP_BUTTON, [b.text for row in start.reply_markup.keyboard for b in row])
         self.profile.assert_not_awaited()
@@ -414,11 +569,12 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.send("/add")).text, self.module.LINK_PROMPT)
         self.assertIn("Готово.", (await self.send("165682118")).text)
         original = db.get_player(165682118), db.get_rating(165682118)
-        self.assertIn("Готово.", (await self.send("/add https://www.dotabuff.com/players/165682118")).text)
+        self.assertIn("Этот Dota-профиль уже подключён.", (await self.send("/add https://www.dotabuff.com/players/165682118")).text)
         self.assertEqual((db.get_player(165682118), db.get_rating(165682118)), original)
         self.history.assert_awaited_once()
 
     async def test_sync_buttons_show_turbo_updates_and_fresh_matches(self):
+        self.enterContext(patch.object(self.module, "MANUAL_SYNC_COOLDOWN", 0))
         await self.send("/add 165682118")
         start = db.get_player(165682118)["tracking_started_at"]
         with patch.object(OpenDotaClient, "get_matches_for_sync", new=AsyncMock(return_value=[

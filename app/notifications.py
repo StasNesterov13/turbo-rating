@@ -13,16 +13,23 @@ logger = logging.getLogger(__name__)
 MAX_DETAIL_LINES = 50
 
 
-def format_rating_updates(updates: list[RatingUpdate], *, manual: bool = False) -> str:
+def format_rating_updates(
+    updates: list[RatingUpdate], *, manual: bool = False,
+    position_before: int | None = None, position_after: int | None = None,
+) -> str:
     if not updates:
         return ""
     before, after = updates[0].rating_before, updates[-1].rating_after
+    position = ""
+    if position_after is not None:
+        change = f"#{position_before} → " if position_before is not None and position_before != position_after else ""
+        position = f"\n\nМесто: {change}#{position_after}"
     if len(updates) == 1 and not manual:
         update = updates[0]
-        title = "🟢 Победа в Turbo" if update.win else "🔴 Поражение в Turbo"
+        title = "🟢 Победа" if update.win else "🔴 Поражение"
         return (
-            f"{title}\n\n{get_hero_name(update.hero_id)}\n\n"
-            f"{update.rating_delta:+.0f} TR\n{before:.0f} → {after:.0f}"
+            f"{title} · {get_hero_name(update.hero_id)}\n\n"
+            f"{update.rating_delta:+.0f} TR\n{before:.0f} → {after:.0f}{position}"
         )
 
     lines = [] if manual else [f"🎮 Новые Turbo-матчи: {len(updates)}", ""]
@@ -42,13 +49,18 @@ def format_rating_updates(updates: list[RatingUpdate], *, manual: bool = False) 
     if len(updates) > shown:
         lines.append(f"… ещё матчей: {len(updates) - shown}")
     lines.extend(["", f"Rating: {before:.0f} → {after:.0f}"])
-    return "\n".join(lines)
+    return "\n".join(lines) + position
 
 
 async def notify_rating_updates(bot: Bot, account_id: int, updates: list[RatingUpdate]) -> None:
     if not updates:
         return
-    text = format_rating_updates(updates)
+    before = db.get_leaderboard_position(account_id, rating=updates[0].rating_before)
+    after = db.get_leaderboard_position(account_id, rating=updates[-1].rating_after)
+    text = format_rating_updates(
+        updates, position_before=before["position"] if before else None,
+        position_after=after["position"] if after else None,
+    )
     for telegram_id in db.get_telegram_ids_by_account(account_id):
         try:
             await bot.send_message(telegram_id, text)

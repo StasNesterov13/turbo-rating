@@ -73,6 +73,11 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.recent = self.enterContext(patch.object(
             OpenDotaClient, "get_matches_for_sync", new=AsyncMock(return_value=[])
         ))
+        self.enterContext(patch.object(OpenDotaClient, "get_player", new=AsyncMock(
+            side_effect=lambda account_id: {"profile": {
+                "account_id": account_id, "personaname": db.get_player(account_id)["nickname"],
+            }},
+        )))
 
     async def test_existing_player_lazy_initialization(self):
         original = db.get_player(42)
@@ -211,8 +216,12 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(db.get_player(43), original)
 
     async def test_telegram_commands(self):
+        import importlib
         from aiogram import Bot, Dispatcher
         from aiogram.types import Chat, Message, Update, User
+        from app import bot as bot_module
+        importlib.reload(bot_module)
+        self.enterContext(patch.object(bot_module, "MANUAL_SYNC_COOLDOWN", 0))
         from app.bot import router, ADD_ACCOUNT_MESSAGE
 
         dispatcher = Dispatcher()
