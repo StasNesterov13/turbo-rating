@@ -538,13 +538,14 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         response = await self.send(RATING_HELP_BUTTON)
         self.assertIsNone(await self.state())
         self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
-        for passage in ("🏆 Как считается Turbo Rating", "по последним 20 Turbo-матчам.",
-                        "10W / 10L → ~1000 TR\n14W / 6L → ~1095 TR\n8W / 12L → ~953 TR",
-                        "Если у тебя 1000 TR:\nWIN → примерно +16\nLOSE → примерно -16",
-                        "Если ты уже поднялся до 1200 TR:\nWIN → примерно +8\nLOSE → примерно -24",
-                        "Учитывается только WIN / LOSE."):
-            self.assertIn(passage, response.text)
-        for technical in ("Elo", "K-factor", "expected_score"):
+        self.assertEqual(response.text,
+                         "🏆 Как считается Turbo Rating\n\n"
+                         "Стартовый TR считается по последним 20 Turbo.\n\n"
+                         "После подключения:\n\n"
+                         "1000 TR → WIN +16 / LOSE -12\n1400 TR → WIN +20 / LOSE -14\n"
+                         "1800 TR → WIN +24 / LOSE -16\n2000 TR → WIN +26 / LOSE -17\n\n"
+                         "Чем выше TR, тем больше очков даёт победа.\nПобеда всегда ценнее поражения.")
+        for technical in ("Elo", "K-factor", "expected_score", "expected score"):
             self.assertNotIn(technical, response.text)
         db.link_telegram_user(201, 42)
         registered = await self.send(RATING_HELP_BUTTON)

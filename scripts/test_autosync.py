@@ -235,7 +235,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([first.args[0], second.args[0]], [101, 102])
         self.assertEqual(first.args[1], second.args[1])
         self.assertIn("🎮 Новые Turbo-матчи: 2", first.args[1])
-        self.assertIn("Rating: 1000 → 999", first.args[1])
+        self.assertIn("Rating: 1000 → 1004", first.args[1])
         self.bot.send_message.reset_mock()
         await sync_tracked_players(self.bot)
         self.bot.send_message.assert_not_awaited()
@@ -279,11 +279,14 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_notification_formats_and_bounded_message_length(self):
         win = RatingUpdate(1, 1001, 44, True, 1000, 16, 1016)
-        loss = RatingUpdate(2, 1002, 14, False, 1016, -16.73630679352, 999.26369320648)
+        loss = RatingUpdate(2, 1002, 14, False, 1016, -12.08, 1003.92)
         self.assertIn("🟢 Победа в Turbo", format_rating_updates([win]))
         self.assertIn("🔴 Поражение в Turbo", format_rating_updates([loss]))
         self.assertIn("🟢 Turbo WIN: Hero #44  +16 TR", format_rating_updates([win, loss], manual=True))
-        self.assertIn("Rating: 1000 → 999", format_rating_updates([win, loss]))
+        self.assertIn("Rating: 1000 → 1004", format_rating_updates([win, loss]))
+        self.assertIn("-12 TR\n1016 → 1004", format_rating_updates([loss]))
+        self.assertEqual(loss.rating_delta, -12.08)
+        self.assertEqual(loss.rating_after, 1003.92)
         self.assertEqual(format_rating_updates([]), "")
         self.assertLess(len(format_rating_updates([win] * 1000).encode("utf-16-le")) // 2, 4096)
 
@@ -320,12 +323,12 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
             text = message.answer.await_args.args[0]
             self.assertIn("Новых Turbo: 2", text)
             self.assertIn("WIN  +16", text)
-            self.assertIn("LOSE  -17", text)
-            self.assertIn("Rating:\n1000 → 999", text)
+            self.assertIn("LOSE  -12", text)
+            self.assertIn("Rating:\n1000 → 1004", text)
             notify.assert_not_awaited()
         self.fetch.return_value = [match(3, 1003, game_mode=22)]
         await sync_command(message)
-        self.assertEqual(message.answer.await_args.args[0], "Данные актуальны.\n\nTurbo Rating: 999")
+        self.assertEqual(message.answer.await_args.args[0], "Данные актуальны.\n\nTurbo Rating: 1004")
         self.assertEqual(db.count_player_matches(42), 3)
 
 

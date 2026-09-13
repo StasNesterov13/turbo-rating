@@ -10,7 +10,6 @@ from app.services.opendota import OpenDotaClient
 
 BASE_RATING = 1000.0
 ELO_SCALE = 400.0
-K_FACTOR = 32.0
 CALIBRATION_MATCHES = 20
 PRIOR_WINS = 5
 PRIOR_LOSSES = 5
@@ -23,23 +22,20 @@ def calculate_initial_rating(wins: int, matches: int) -> float:
     return BASE_RATING + ELO_SCALE * math.log10(p / (1 - p))
 
 
-def calculate_expected_score(rating: float) -> float:
+def calculate_rating_delta(rating: float, win: bool) -> float:
     if not math.isfinite(rating):
         raise ValueError("Рейтинг должен быть конечным числом.")
-    exponent = (rating - BASE_RATING) / ELO_SCALE
-    # Equivalent Elo formula without overflow for a very low rating.
-    if exponent >= 0:
-        return 1 / (1 + 10 ** -exponent)
-    power = 10 ** exponent
-    return power / (1 + power)
+    if type(win) is not bool:
+        raise ValueError("win должен быть bool.")
+    extra = max(float(rating) - BASE_RATING, 0.0)
+    return 16.0 + 0.01 * extra if win else -(12.0 + 0.005 * extra)
 
 
 def calculate_new_rating(rating: float, win: bool) -> tuple[float, float, float]:
-    if type(win) is not bool:
-        raise ValueError("win должен быть bool.")
-    expected = calculate_expected_score(rating)
-    new_rating = rating + K_FACTOR * (int(win) - expected)
-    return new_rating, new_rating - rating, expected
+    delta = calculate_rating_delta(rating, win)
+    # Keep the existing DB callback contract and NOT NULL expected_score column.
+    # This compatibility value has no effect on rating calculations.
+    return float(rating) + delta, delta, 0.5
 
 
 async def initialize_rating(
