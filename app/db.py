@@ -1,13 +1,17 @@
 """Local SQLite storage for tracked players and their matches."""
 
 from contextlib import contextmanager
+import os
 from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Callable, Iterator
 
 
-DB_PATH = Path(__file__).resolve().parents[1] / "data" / "turbo_rating.db"
+DB_PATH = Path(
+    os.getenv("DB_PATH")
+    or Path(__file__).resolve().parents[1] / "data" / "turbo_rating.db"
+)
 
 
 @contextmanager
