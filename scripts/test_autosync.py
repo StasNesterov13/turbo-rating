@@ -238,21 +238,21 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         self.player(43, 1200)
         message.answer.reset_mock()
         await top_command(message)
-        self.assertEqual(message.answer.await_args.args[0], "🏆 Turbo Rating\n\n🥇 Player 43 — 1200\n👉 🥈 Test Player — 1000")
+        self.assertEqual(message.answer.await_args.args[0], "🥇 Turbo Rating\n\n🥇 Player 43 — 1200\n🥈 Test Player — 1000 ← вы")
         self.fetch.return_value = [match(2, 1002, False), match(1, 1001)]
         message.answer.reset_mock()
         with patch("app.notifications.notify_rating_updates", new=AsyncMock()) as notify:
             await sync_command(message)
             message.answer.assert_awaited_once()
             text = message.answer.await_args.args[0]
-            self.assertIn("Новых матчей: 2", text)
-            self.assertIn("🟢 Turbo WIN: Hero #44  +16 TR", text)
-            self.assertIn("🔴 Turbo LOSE: Hero #44  -17 TR", text)
-            self.assertIn("Rating: 1000 → 999", text)
+            self.assertIn("Новых Turbo: 2", text)
+            self.assertIn("WIN  +16", text)
+            self.assertIn("LOSE  -17", text)
+            self.assertIn("Rating:\n1000 → 999", text)
             notify.assert_not_awaited()
         self.fetch.return_value = [match(3, 1003, game_mode=22)]
         await sync_command(message)
-        self.assertEqual(message.answer.await_args.args[0], "Синхронизация завершена.\nНовых Turbo-матчей нет.")
+        self.assertEqual(message.answer.await_args.args[0], "Данные актуальны.\n\nTurbo Rating: 999")
         self.assertEqual(db.count_player_matches(42), 3)
 
 

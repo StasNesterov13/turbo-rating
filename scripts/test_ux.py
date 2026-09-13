@@ -19,10 +19,14 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app import db
-from app.keyboards import MAIN_KEYBOARD
+from app.keyboards import (
+    MAIN_KEYBOARD, UNLINKED_KEYBOARD, LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON,
+)
 from app.notifications import format_rating_updates
 from app.services import heroes
 from app.services.game_modes import get_game_mode_name
+from app.services.accounts import parse_dota_account_id
+from app.services.opendota import OpenDotaClient
 from app.services.rating import apply_rating_changes
 from app.services.sync import RatingUpdate, SyncResult
 from scripts.test_rating import match
@@ -164,10 +168,10 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["account_id"] for row in db.get_leaderboard()], list(range(1, 21)))
         message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
         await top_command(message)
-        self.assertIn("Ваше место: #27 — 1000", message.answer.await_args.args[0])
+        self.assertIn("Ваше место:\n#27 — 1000", message.answer.await_args.args[0])
         db.link_telegram_user(101, 3)
         await top_command(message)
-        self.assertIn("👉 🥉 Player 3 — 1000", message.answer.await_args.args[0])
+        self.assertIn("🥉 Player 3 — 1000 ← вы", message.answer.await_args.args[0])
 
     async def test_commands_and_buttons_through_dispatcher(self):
         from app import bot as bot_module
@@ -199,8 +203,8 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     response = await send(command)
                     self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
                 buttons = [button.text for row in MAIN_KEYBOARD.keyboard for button in row]
-                self.assertEqual(buttons, ["🏆 Рейтинг", "📊 Статистика", "🥇 Топ", "🎮 Матчи", "🔄 Обновить"])
-                for button, command in zip(buttons, ("/rating", "/stats", "/top", "/matches", "/sync")):
+                self.assertEqual(buttons, ["🏆 Мой рейтинг", "🥇 Топ игроков", "📊 Статистика", "🎮 Матчи", "🔄 Обновить", "👤 Профиль", RATING_HELP_BUTTON])
+                for button, command in zip(buttons, ("/rating", "/top", "/stats", "/matches", "/sync", "/profile")):
                     self.assertEqual((await send(button)).text, (await send(command)).text)
                 self.assertEqual(sync.await_count, 2)
                 sync.assert_awaited_with(42, api_key=None)
@@ -212,13 +216,24 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                 profile = (await send("/profile")).text
                 self.assertIn("Turbo игр: 3", profile)
                 self.assertIn("Winrate: 33.3%", profile)
-                self.assertIn("01.01.1970", profile)
+                self.assertIn("Место: #1", profile)
+                self.assertNotIn("Отслеживание", profile)
                 stats = (await send("/stats")).text
                 self.assertIn("Победы: 1\nПоражения: 2", stats)
                 for command in ("/rating", "/stats", "/matches", "/sync", "/profile"):
-                    self.assertEqual((await send(command, user_id=999)).text, bot_module.ADD_ACCOUNT_MESSAGE)
+                    response = await send(command, user_id=999)
+                    self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
+                    self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
+                for button in buttons:
+                    if button in ("🥇 Топ игроков", RATING_HELP_BUTTON):
+                        continue
+                    response = await send(button, user_id=999)
+                    self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
+                    self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
+                self.assertEqual((await send("🏆 Рейтинг")).text, (await send("/rating")).text)
+                self.assertEqual((await send("🥇 Топ")).text, (await send("/top")).text)
         self.assertEqual([cmd.command for cmd in bot_module.BOT_COMMANDS],
-                         ["start", "add", "rating", "stats", "top", "matches", "sync"])
+                         ["start", "add", "rating", "stats", "top", "matches", "sync", "profile"])
 
     async def test_named_notifications_and_length_with_long_names(self):
         win = RatingUpdate(1, 1001, 44, True, 1000, 16, 1016)
@@ -240,6 +255,192 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
     async def test_game_modes(self):
         self.assertEqual([get_game_mode_name(mode) for mode in (23, 1, 22, 77)],
                          ["Turbo", "All Pick", "Ranked All Pick", "Mode #77"])
+
+
+class AccountParsingTests(unittest.TestCase):
+    def test_supported_formats(self):
+        for text in ("165682118", " 165682118\n",
+                     "https://www.opendota.com/players/165682118",
+                     "https://www.dotabuff.com/players/165682118",
+                     "https://opendota.com/players/165682118/?foo=bar#overview",
+                     "http://dotabuff.com/players/165682118"):
+            with self.subTest(text=text):
+                self.assertEqual(parse_dota_account_id(text), 165682118)
+        self.assertEqual(parse_dota_account_id("1"), 1)
+        self.assertEqual(parse_dota_account_id("4294967295"), 2**32 - 1)
+
+    def test_invalid_formats(self):
+        for text in ("", "0", "-1", "+123", "12.5", "4294967296", "76561198125947846",
+                     "hello", "１２３", "9" * 5000, "https://[bad",
+                     "https://www.opendota.com.evil.test/players/165682118",
+                     "https://www.opendota.com@evil.test/players/165682118",
+                     "https://www.opendota.com/players/0",
+                     "https://www.opendota.com/players/165682118/matches",
+                     "https://steamcommunity.com/id/someone", "/add 165682118"):
+            with self.subTest(text=text[:100]):
+                self.assertIsNone(parse_dota_account_id(text))
+
+
+class OnboardingTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        from app import bot as bot_module
+        self.module = importlib.reload(bot_module)
+        temporary = tempfile.TemporaryDirectory(prefix="turbo-onboarding-test-")
+        self.addCleanup(temporary.cleanup)
+        self.enterContext(patch.object(db, "DB_PATH", Path(temporary.name) / "test.db"))
+        db.init_db()
+        db.add_player(42, "Leader", 1000)
+        db.create_rating(42, 1200, [], 0)
+        self.dispatcher = Dispatcher()
+        self.dispatcher.include_router(self.module.router)
+        self.addAsyncCleanup(self.dispatcher.storage.close)
+        self.bot = await self.enterAsyncContext(Bot(token="123456:LOCAL_ONLY_TEST_TOKEN"))
+        self.outgoing = self.enterContext(patch.object(Bot, "__call__", new=AsyncMock(return_value=True)))
+        self.profile = self.enterContext(patch.object(OpenDotaClient, "get_player", new=AsyncMock(
+            return_value={"profile": {"account_id": 165682118, "personaname": "ДЕРЕВЕНСКИЙ"}}
+        )))
+        self.history = self.enterContext(patch.object(OpenDotaClient, "get_turbo_matches_before", new=AsyncMock(
+            return_value=[match(i, 900 - i, i < 8) for i in range(20)]
+        )))
+
+    async def send(self, text, user_id=201, *, expect_answer=True):
+        self.outgoing.reset_mock()
+        message = Message(message_id=1, date=datetime.now(timezone.utc),
+                          chat=Chat(id=user_id, type="private"),
+                          from_user=User(id=user_id, is_bot=False, first_name="Test"), text=text)
+        await self.dispatcher.feed_update(self.bot, Update(update_id=1, message=message))
+        if expect_answer:
+            self.outgoing.assert_awaited_once()
+            return self.outgoing.await_args.args[0]
+        self.outgoing.assert_not_awaited()
+
+    async def state(self, user_id=201):
+        context = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=user_id, user_id=user_id)
+        return await context.get_state()
+
+    async def test_start_link_by_id_and_urls_then_repeat_start(self):
+        original = None
+        for user_id, value in enumerate(("165682118", "https://www.opendota.com/players/165682118",
+                                         "https://www.dotabuff.com/players/165682118"), 201):
+            response = await self.send("/start", user_id)
+            self.assertIn("Как это работает:", response.text)
+            self.assertIn("Чтобы начать, привяжите Dota-профиль.", response.text)
+            self.assertNotIn("Leader", response.text)
+            self.assertNotIn("/add", response.text)
+            self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
+            self.assertEqual(
+                [button.text for row in response.reply_markup.keyboard for button in row],
+                [LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON],
+            )
+            self.assertEqual((await self.send(VIEW_TOP_BUTTON, user_id)).text,
+                             (await self.send("/top", user_id)).text)
+            self.assertEqual((await self.send(LINK_BUTTON, user_id)).text, self.module.LINK_PROMPT)
+            self.assertEqual(await self.state(user_id), self.module.LinkDota.waiting_for_account.state)
+            response = await self.send(value, user_id)
+            self.profile.assert_awaited_with(165682118)
+            self.assertIn("Готово.", response.text)
+            self.assertIn("Turbo Rating: 953", response.text)
+            self.assertIn("Место: #2", response.text)
+            self.assertIn("по последним 20 Turbo-матчам", response.text)
+            self.assertNotIn("OpenDota", response.text)
+            self.assertNotIn("account_id", response.text)
+            self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
+            self.assertIsNone(await self.state(user_id))
+            self.assertEqual(db.get_telegram_player(user_id)["account_id"], 165682118)
+            snapshot = db.get_player(165682118), db.get_rating(165682118)
+            if original is None:
+                original = snapshot
+            self.assertEqual(snapshot, original)
+            repeat = await self.send("/start", user_id)
+            self.assertIn("Ваш рейтинг: 953\nМесто: #2", repeat.text)
+            self.assertIn("🥇 Leader — 1200", repeat.text)
+            self.assertNotIn("Как это работает:", repeat.text)
+            self.assertNotIn("Привяжите", repeat.text)
+            self.assertEqual(repeat.reply_markup, MAIN_KEYBOARD)
+        self.history.assert_awaited_once()
+
+    async def test_rating_help_before_and_after_registration(self):
+        await self.send(LINK_BUTTON)
+        response = await self.send(RATING_HELP_BUTTON)
+        self.assertIsNone(await self.state())
+        self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
+        for passage in ("Как считается Turbo Rating", "до 20 последних Turbo-игр",
+                        "Средняя точка — 1000 TR.", "WIN → рейтинг растёт",
+                        "LOSE → рейтинг падает", "не влияют на рейтинг.",
+                        "Учитывается только результат команды."):
+            self.assertIn(passage, response.text)
+        for technical in ("Elo", "K-factor", "expected_score"):
+            self.assertNotIn(technical, response.text)
+        db.link_telegram_user(201, 42)
+        registered = await self.send(RATING_HELP_BUTTON)
+        self.assertEqual(registered.text, response.text)
+        self.assertEqual(registered.reply_markup, MAIN_KEYBOARD)
+        start = await self.send("/start")
+        self.assertIn("Ваш рейтинг: 1200", start.text)
+        self.assertNotIn("Как это работает:", start.text)
+        self.assertIn(RATING_HELP_BUTTON, [b.text for row in start.reply_markup.keyboard for b in row])
+        self.profile.assert_not_awaited()
+        self.history.assert_not_awaited()
+
+    async def test_invalid_input_and_network_failure_allow_retry(self):
+        await self.send(LINK_BUTTON)
+        for invalid in ("bad", "0", None):
+            self.assertEqual((await self.send(invalid)).text, self.module.INVALID_ACCOUNT_MESSAGE)
+            self.assertIsNotNone(await self.state())
+        self.profile.assert_not_awaited()
+        self.profile.side_effect = httpx.ReadTimeout("private-url")
+        response = await self.send("165682118")
+        self.assertNotIn("private-url", response.text)
+        self.assertIsNone(db.get_telegram_player(201))
+        self.assertIsNotNone(await self.state())
+        self.profile.side_effect = None
+        self.assertIn("Готово.", (await self.send("165682118")).text)
+        self.assertIsNone(await self.state())
+
+    async def test_waiting_is_per_user_and_menu_exits_linking(self):
+        await self.send(LINK_BUTTON)
+        await self.send("165682118", user_id=202, expect_answer=False)
+        self.assertIsNotNone(await self.state(201))
+        self.assertIsNone(await self.state(202))
+        self.profile.assert_not_awaited()
+        for navigation in ("/start", "🥇 Топ игроков", "🏆 Мой рейтинг"):
+            await self.send(LINK_BUTTON)
+            response = await self.send(navigation)
+            self.assertNotEqual(response.text, self.module.INVALID_ACCOUNT_MESSAGE)
+            self.assertIsNone(await self.state())
+        self.profile.assert_not_awaited()
+
+    async def test_add_without_argument_uses_same_link_flow(self):
+        self.assertEqual((await self.send("/add")).text, self.module.LINK_PROMPT)
+        self.assertIn("Готово.", (await self.send("165682118")).text)
+        original = db.get_player(165682118), db.get_rating(165682118)
+        self.assertIn("Готово.", (await self.send("/add https://www.dotabuff.com/players/165682118")).text)
+        self.assertEqual((db.get_player(165682118), db.get_rating(165682118)), original)
+        self.history.assert_awaited_once()
+
+    async def test_sync_buttons_show_turbo_updates_and_fresh_matches(self):
+        await self.send("/add 165682118")
+        start = db.get_player(165682118)["tracking_started_at"]
+        with patch.object(OpenDotaClient, "get_matches_for_sync", new=AsyncMock(return_value=[
+            match(100, start), match(101, start + 1, False), match(102, start + 2, game_mode=1),
+        ])) as fetch:
+            response = await self.send("🔄 Обновить")
+            self.assertIn("Новых Turbo: 2", response.text)
+            self.assertIn("WIN  +", response.text)
+            self.assertIn("LOSE  -", response.text)
+            self.assertIn("Rating:\n", response.text)
+            for technical in ("API", "дубликат", "пропущено", "получено"):
+                self.assertNotIn(technical, response.text)
+            fetch.assert_awaited_once_with(165682118, start)
+            matches = (await self.send("🎮 Матчи")).text
+            self.assertIn("All Pick", matches)
+            self.assertIn("Turbo", matches)
+            self.assertEqual(db.count_rated_matches(165682118), 2)
+            rating = (await self.send("🏆 Мой рейтинг")).text
+            self.assertIn("2 игры · 1 победа · 1 поражение", rating)
+            response = await self.send("🔄 Обновить")
+            current = db.get_rating(165682118)["current_rating"]
+            self.assertEqual(response.text, f"Данные актуальны.\n\nTurbo Rating: {current:.0f}")
 
 
 if __name__ == "__main__":
