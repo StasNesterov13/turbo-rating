@@ -408,6 +408,26 @@ def get_rating_history(
         return [dict(row) for row in connection.execute(query, parameters).fetchall()]
 
 
+def get_turbo_match_history(account_id: int, limit: int = 10) -> list[dict[str, Any]]:
+    """Read recent tracked Turbo matches with their original stored TR changes."""
+    if type(limit) is not int or limit <= 0:
+        raise ValueError("limit должен быть положительным целым числом.")
+    with _connect() as connection:
+        rows = connection.execute(
+            """
+            SELECT m.*, h.rating_delta, h.rating_after FROM matches m
+            JOIN players p ON p.account_id = m.account_id
+            LEFT JOIN rating_history h ON h.account_id = m.account_id AND h.match_id = m.match_id
+            WHERE m.account_id = ? AND m.game_mode = 23 AND m.is_calibration = 0
+                AND m.start_time >= p.tracking_started_at
+            ORDER BY m.start_time DESC, m.match_id DESC
+            LIMIT ?
+            """,
+            (account_id, limit),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def count_rated_matches(account_id: int) -> int:
     with _connect() as connection:
         return connection.execute(

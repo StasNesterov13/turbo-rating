@@ -19,6 +19,7 @@ if __package__ in (None, ""):
 from app import db
 from app.keyboards import HISTORY_BUTTON, MAIN_KEYBOARD, UNLINKED_KEYBOARD
 from app.notifications import notify_rating_updates
+from app.services import heroes
 from app.services.sync import RatingUpdate
 from scripts.test_rating import match
 
@@ -44,6 +45,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.bot = await self.enterAsyncContext(Bot(token="123456:LOCAL_ONLY_TEST_TOKEN"))
         self.outgoing = self.enterContext(patch.object(Bot, "__call__", new=AsyncMock(return_value=True)))
         self.enterContext(patch.object(httpx.AsyncClient, "send", side_effect=AssertionError("Unexpected HTTP")))
+        self.enterContext(patch.object(heroes, "_hero_names", {44: "Phantom Assassin", 14: "Pudge"}))
         self.next_match = 1
 
     def player(self, account_id, initial=1000, *, registered=None, linked=True, nickname=None):
@@ -163,17 +165,24 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         before = self.snapshot()
         response = await self.send("/history")
         self.assertEqual(response.text, (await self.send(HISTORY_BUTTON)).text)
+        for alias in ("/matches", "🎮 Матчи", "📈 История", "📈 История TR"):
+            self.assertEqual(response.text, (await self.send(alias)).text)
         self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
         self.assertEqual(response.text,
-                         "📈 История TR\n\n"
-                         "Сегодня: +18 TR\n7 дней: +84 TR\n30 дней: +137 TR\n\n"
-                         "7 дней назад: #6 → #3\n30 дней назад: #9 → #3\n\n"
-                         "Последние изменения:\n\n13.09  +17   1124 TR\n13.09  +1   1107 TR\n"
-                         "12.09  +12   1106 TR\n11.09  +14   1094 TR\n07.09  +40   1080 TR\n"
-                         "03.09  -147   1040 TR\n19.08  +200   1187 TR")
+                         "📜 История матчей\n\n"
+                         "13.09\nWIN · Phantom Assassin\n+17 TR → 1124 TR\n\n"
+                         "12.09\nWIN · Phantom Assassin\n+1 TR → 1107 TR\n\n"
+                         "12.09\nWIN · Phantom Assassin\n+12 TR → 1106 TR\n\n"
+                         "11.09\nWIN · Phantom Assassin\n+14 TR → 1094 TR\n\n"
+                         "07.09\nWIN · Phantom Assassin\n+40 TR → 1080 TR\n\n"
+                         "03.09\nLOSE · Phantom Assassin\n-147 TR → 1040 TR\n\n"
+                         "19.08\nWIN · Phantom Assassin\n+200 TR → 1187 TR\n\n"
+                         "Сегодня: +18 TR\n7 дней: +84 TR\n30 дней: +137 TR")
         rating = (await self.send("/rating")).text
-        self.assertEqual(rating, "🏆 Мой рейтинг\n\n1124 TR\nМесто: #3\nСтарт: 987 TR\n"
-                                 "Рекорд: 1187 TR")
+        self.assertEqual(rating, "👤 Профиль\n\nДЕРЕВЕНСКИЙ\nDota ID: 42\n\n"
+                                 "Turbo Rating: 1124 TR\nМесто: #3\nСтартовый TR: 987\n"
+                                 "Рекорд: 1187 TR\n\nДата подключения:\n15.07.2026")
+        self.assertEqual(rating, (await self.send("/profile")).text)
         self.assertEqual(self.snapshot(), before)
 
     async def test_history_limit_empty_and_unlinked_users(self):
@@ -185,16 +194,38 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("Сейчас:", empty)
         self.assertNotIn("Рекорд:", empty)
         self.assertIn("Сегодня: +0 TR\n7 дней: +0 TR\n30 дней: +0 TR", empty)
-        self.assertIn("7 дней назад: ещё не зарегистрирован", empty)
-        self.assertIn("30 дней назад: ещё не зарегистрирован", empty)
-        self.assertTrue(empty.endswith("Начислений пока нет."))
+        self.assertIn("Матчей пока нет.", empty)
         for index in range(12):
             self.event(42, self.timestamp - 12 + index, 1)
         text = (await self.send("/history")).text
-        lines = text.split("Последние изменения:\n\n")[1].splitlines()
-        self.assertEqual(len(lines), 10)
-        self.assertEqual(lines[0], "13.09  +1   1199 TR")
-        self.assertEqual(lines[-1], "13.09  +1   1190 TR")
+        matches = text.split("\n\n")[1:-1]
+        self.assertEqual(len(matches), 10)
+        self.assertEqual(matches[0], "13.09\nWIN · Phantom Assassin\n+1 TR → 1199 TR")
+        self.assertEqual(matches[-1], "13.09\nWIN · Phantom Assassin\n+1 TR → 1190 TR")
+
+    async def test_match_history_filters_modes_and_calibration_and_preserves_unrated_games(self):
+        self.player(42)
+        self.player(43)
+        self.event(42, self.timestamp - 3600, 16, match_id=1, played_at=self.timestamp - 2 * self.day)
+        self.event(42, self.timestamp - 7200, -12, match_id=2, played_at=self.timestamp - self.day)
+        self.event(43, self.timestamp, 25, match_id=50)
+        unknown = match(50, self.timestamp - 1)
+        unknown["radiant_win"] = None
+        db.save_match(42, unknown)
+        db.save_match(42, match(51, self.timestamp - 2))
+        db.save_match(42, match(52, self.timestamp), is_calibration=True)
+        db.save_match(42, match(53, self.timestamp, game_mode=1))
+        db.save_match(42, match(54, self.timestamp - 70 * self.day))
+        before = self.snapshot()
+        history = db.get_turbo_match_history(42)
+        self.assertEqual([row["match_id"] for row in history], [50, 51, 2, 1])
+        self.assertEqual([row["rating_delta"] for row in history], [None, None, -12, 16])
+        text = (await self.send("/matches")).text
+        self.assertIn("Результат пока неизвестен · Phantom Assassin\nTR не начислен.", text)
+        self.assertEqual(text.count("TR не начислен."), 2)
+        self.assertIn("12.09\nLOSE · Phantom Assassin\n-12 TR → 1004 TR", text)
+        self.assertIn("11.09\nWIN · Phantom Assassin\n+16 TR → 1016 TR", text)
+        self.assertEqual(self.snapshot(), before)
 
     async def test_top_arrows_no_movement_for_new_player_and_own_marker(self):
         self.demo()

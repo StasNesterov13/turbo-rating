@@ -118,19 +118,23 @@ class SeasonTests(unittest.IsolatedAsyncioTestCase):
         state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=999, user_id=999)
         self.assertIsNone(await state.get_state())
 
-    async def test_top_has_prizes_countdown_and_keeps_existing_ranking(self):
+    async def test_top_keeps_ranking_and_prizes_screen_has_countdown(self):
         self.podium()
         text = (await self.send("/top")).text
-        self.assertTrue(text.startswith("🥇 Turbo Rating"))
+        self.assertTrue(text.startswith("Turbo Rating"))
         self.assertIn("🥈 Stas — 1210", text)
         self.assertIn("← вы", text)
         self.assertIn("4. Fourth — 1000", text)
-        self.assertTrue(text.endswith("💰 Призы: 3000 ₽ / 2000 ₽ / 1000 ₽\nДо конца сезона: 18 дней 6 часов"))
+        prizes = (await self.send("/prizes")).text
+        self.assertIn("🥇 1 место — 3 000 ₽", prizes)
+        self.assertIn("🥈 2 место — 2 000 ₽", prizes)
+        self.assertIn("🥉 3 место — 1 000 ₽", prizes)
+        self.assertIn("До окончания:\n18 дней 6 часов", prizes)
         self.assertIsNone(db.get_final_standings())
 
     async def test_empty_and_partial_podium_before_and_after_deadline(self):
         self.assertIn("Рейтинг игроков пока пуст.", (await self.send("/prizes")).text)
-        self.assertIn("💰 Призы:", (await self.send("/top")).text)
+        self.assertEqual("Turbo Rating\n\nРейтинг игроков пока пуст.", (await self.send("/top")).text)
         self.player(1)
         text = (await self.send("/prizes")).text.split("Текущий топ:")[1]
         self.assertEqual(text.count(" TR"), 1)
@@ -145,8 +149,8 @@ class SeasonTests(unittest.IsolatedAsyncioTestCase):
         self.clock.return_value = season.SEASON_END_AT - timedelta(microseconds=1)
         db.save_match(1, match(100, self.end - 100))
         self.assertEqual(len(apply_rating_changes(1)), 1)
-        self.assertEqual(db.get_rating(1)["current_rating"], 1016)
-        self.assertIn("🥇 Player 1 — 1016 TR", (await self.send("/prizes")).text)
+        self.assertEqual(db.get_rating(1)["current_rating"], 1025)
+        self.assertIn("🥇 Player 1 — 1025 TR", (await self.send("/prizes")).text)
         self.assertEqual(self.snapshot_row(), [])
 
     async def test_deadline_stops_pending_and_new_matches_for_every_player(self):

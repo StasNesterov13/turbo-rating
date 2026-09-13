@@ -47,46 +47,30 @@ class MathematicsTests(unittest.TestCase):
     def test_twenty_losses(self):
         self.assertAlmostEqual(calculate_initial_rating(0, 20), 720.41, places=2)
 
-    def test_progressive_examples(self):
-        for rating, win_delta, loss_delta in (
-            (1000, 16, -12), (1200, 18, -13), (1400, 20, -14),
-            (1600, 22, -15), (1800, 24, -16), (2000, 26, -17), (3000, 36, -22),
-        ):
-            for win, delta in ((True, win_delta), (False, loss_delta)):
+    def test_fixed_delta_and_rating_examples(self):
+        for rating in (100, 1000, 1200, 1400, 1600, 1800, 2000, 3000):
+            for win, delta in ((True, 25.0), (False, -25.0)):
                 with self.subTest(rating=rating, win=win):
-                    self.assertEqual(calculate_rating_delta(rating, win), delta)
+                    self.assertEqual(calculate_rating_delta(win), delta)
                     result = calculate_new_rating(rating, win)
                     self.assertEqual(result, (rating + delta, delta, 0.5))
                     self.assertIsInstance(result[0], float)
                     self.assertIsInstance(result[1], float)
 
-    def test_below_1000_keeps_base_delta_without_rating_floor(self):
-        for rating in (-1e6, -1000, 0, 999.5, 1000):
+    def test_delta_is_independent_of_rating_without_floor_or_ceiling(self):
+        for rating in (-1e6, -1000, 0, 999.5, 1000, 1e6, 1e9):
             with self.subTest(rating=rating):
-                self.assertEqual(calculate_new_rating(rating, True), (rating + 16, 16, 0.5))
-                self.assertEqual(calculate_new_rating(rating, False), (rating - 12, -12, 0.5))
+                self.assertEqual(calculate_new_rating(rating, True), (rating + 25, 25, 0.5))
+                self.assertEqual(calculate_new_rating(rating, False), (rating - 25, -25, 0.5))
 
-    def test_fractional_rating_and_delta_are_not_rounded(self):
+    def test_fractional_rating_is_not_rounded(self):
         for win, expected_delta, expected_rating in (
-            (True, 17.2345, 1140.6845), (False, -12.61725, 1110.83275),
+            (True, 25.0, 1148.45), (False, -25.0, 1098.45),
         ):
             with self.subTest(win=win):
                 new_rating, delta, _ = calculate_new_rating(1123.45, win)
                 self.assertAlmostEqual(delta, expected_delta, places=10)
                 self.assertAlmostEqual(new_rating, expected_rating, places=10)
-
-    def test_progressive_growth_and_no_ceiling(self):
-        previous_win, previous_loss = 0, 0
-        for rating in (1000, 1200, 2000, 3000, 1e6, 1e9):
-            win = calculate_rating_delta(rating, True)
-            loss = -calculate_rating_delta(rating, False)
-            self.assertGreater(win, loss)
-            self.assertGreater(win, previous_win)
-            self.assertGreater(loss, previous_loss)
-            self.assertGreater(win - previous_win, loss - previous_loss)
-            previous_win, previous_loss = win, loss
-        self.assertEqual(calculate_new_rating(1e6, True), (1010006.0, 10006.0, 0.5))
-        self.assertEqual(calculate_new_rating(1e9, False), (994999993.0, -5000007.0, 0.5))
 
     def test_invalid_rating_and_outcome_are_rejected(self):
         for rating in (float("nan"), float("inf"), float("-inf")):
@@ -94,7 +78,7 @@ class MathematicsTests(unittest.TestCase):
                 calculate_new_rating(rating, True)
         for win in (0, 1, None, "WIN"):
             with self.subTest(win=win), self.assertRaises(ValueError):
-                calculate_rating_delta(1000, win)
+                calculate_rating_delta(win)
 
 
 class RatingTests(unittest.IsolatedAsyncioTestCase):
@@ -155,7 +139,7 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         first = await sync_player(42)
         self.assertEqual(first.new_count, 1)
         self.assertEqual(len(first.rating_changes), 1)
-        self.assertEqual(db.get_rating(42)["current_rating"], 1016)
+        self.assertEqual(db.get_rating(42)["current_rating"], 1025)
         old_rating = db.get_rating(42)
         old_history = db.get_rating_history(42)
         second = await sync_player(42)
@@ -164,18 +148,17 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.get_rating(42), old_rating)
         self.assertEqual(db.get_rating_history(42), old_history)
 
-    async def test_chronological_processing_without_rounding(self):
+    async def test_chronological_processing_with_fixed_delta(self):
         self.recent.return_value = [match(3, 1003), match(2, 1002, False), match(1, 1001)]
         result = await sync_player(42)
         self.assertEqual([h["match_id"] for h in result.rating_changes], [1, 2, 3])
-        for event, delta, after in zip(result.rating_changes, (16, -12.08, 16.0392), (1016, 1003.92, 1019.9592)):
+        for event, delta, after in zip(result.rating_changes, (25, -25, 25), (1025, 1000, 1025)):
             self.assertAlmostEqual(event["rating_delta"], delta, places=10)
             self.assertAlmostEqual(event["rating_after"], after, places=10)
             self.assertEqual(event["expected_score"], 0.5)
         current = db.get_rating(42)["current_rating"]
-        self.assertAlmostEqual(current, 1019.9592, places=10)
+        self.assertEqual(current, 1025)
         self.assertIsInstance(current, float)
-        self.assertNotEqual(current, round(current))
 
     async def test_future_matches_preserve_legacy_history_and_calibration(self):
         self.history.return_value = [match(i, 900 - i, i < 10) for i in range(20)]
@@ -205,9 +188,9 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["match_id"] for row in result.rating_changes], [103])
         event = result.rating_changes[0]
         self.assertEqual(event["rating_before"], old_rating["current_rating"])
-        self.assertEqual(event["rating_delta"], 16.0)
+        self.assertEqual(event["rating_delta"], 25.0)
         self.assertEqual(event["expected_score"], 0.5)
-        self.assertEqual(db.get_rating(42), {**old_rating, "current_rating": old_rating["current_rating"] + 16})
+        self.assertEqual(db.get_rating(42), {**old_rating, "current_rating": old_rating["current_rating"] + 25})
         self.assertEqual(db.get_rating_history(42)[1:], old_history)
         self.assertEqual([row for row in db.get_player_matches(42, include_calibration=True) if row["is_calibration"]], calibration)
         new_history = db.get_rating_history(42)
@@ -221,7 +204,7 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.recent.return_value = [match(1, 999), match(2, 1000, False), unknown]
         await sync_player(42)
         self.assertFalse(db.match_exists(42, 1))
-        self.assertEqual(db.get_rating(42)["current_rating"], 988)
+        self.assertEqual(db.get_rating(42)["current_rating"], 975)
         self.assertEqual(db.count_rated_matches(42), 1)
 
     async def test_party_match_is_independent_per_account(self):
@@ -231,8 +214,8 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.recent.return_value = [match(1, 1001)]
         await sync_player(42)
         await sync_player(43)
-        self.assertEqual(db.get_rating(42)["current_rating"], 1016)
-        self.assertEqual(db.get_rating(43)["current_rating"], 1218)
+        self.assertEqual(db.get_rating(42)["current_rating"], 1025)
+        self.assertEqual(db.get_rating(43)["current_rating"], 1225)
         self.assertEqual(db.count_rated_matches(42), 1)
         self.assertEqual(db.count_rated_matches(43), 1)
 
@@ -330,10 +313,9 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(db.get_rating(42))
                 profile = await command("/profile")
                 self.assertIn("Dota ID: 42", profile)
-                self.assertIn("Подключён: 01.01.1970", profile)
-                self.assertNotIn("Rating", profile)
-                self.assertIsNone(db.get_rating(42))
-                self.assertIn("1000 TR", await command("/rating"))
+                self.assertIn("Дата подключения:\n01.01.1970", profile)
+                self.assertIn("Turbo Rating: 1000 TR", profile)
+                self.assertEqual(profile, await command("/rating"))
                 self.assertIsNotNone(db.get_rating(42))
                 db.add_player(43, "Lazy Rating", 1000)
                 db.link_telegram_user(101, 43)
@@ -344,12 +326,14 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(db.get_player(42), original)
                 self.recent.return_value = [match(1, 1001)]
                 self.assertIn(": 1", await command("/sync"))
-                self.assertIn("WIN\nHero #44 · Turbo · 24 мин", await command("/matches"))
+                history = await command("/matches")
+                self.assertIn("WIN · Hero #44\n+25 TR → 1025 TR", history)
+                self.assertEqual(history, await command("/history"))
                 rating_text = await command("/rating")
-                self.assertIn("1016 TR", rating_text)
-                self.assertNotIn("+16", rating_text)
-                self.assertIn("Старт: 1000", rating_text)
-                self.assertIn("Рекорд: 1016 TR", rating_text)
+                self.assertIn("1025 TR", rating_text)
+                self.assertNotIn("+25", rating_text)
+                self.assertIn("Стартовый TR: 1000", rating_text)
+                self.assertIn("Рекорд: 1025 TR", rating_text)
                 self.assertNotIn("Последние", rating_text)
                 self.assertEqual(await command("/stats"), rating_text)
                 await command("/sync")

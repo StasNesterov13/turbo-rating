@@ -22,17 +22,16 @@ def calculate_initial_rating(wins: int, matches: int) -> float:
     return BASE_RATING + ELO_SCALE * math.log10(p / (1 - p))
 
 
-def calculate_rating_delta(rating: float, win: bool) -> float:
-    if not math.isfinite(rating):
-        raise ValueError("Рейтинг должен быть конечным числом.")
+def calculate_rating_delta(win: bool) -> float:
     if type(win) is not bool:
         raise ValueError("win должен быть bool.")
-    extra = max(float(rating) - BASE_RATING, 0.0)
-    return 16.0 + 0.01 * extra if win else -(12.0 + 0.005 * extra)
+    return 25.0 if win else -25.0
 
 
 def calculate_new_rating(rating: float, win: bool) -> tuple[float, float, float]:
-    delta = calculate_rating_delta(rating, win)
+    if not math.isfinite(rating):
+        raise ValueError("Рейтинг должен быть конечным числом.")
+    delta = calculate_rating_delta(win)
     # Keep the existing DB callback contract and NOT NULL expected_score column.
     # This compatibility value has no effect on rating calculations.
     return float(rating) + delta, delta, 0.5

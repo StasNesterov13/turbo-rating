@@ -3,7 +3,6 @@
 from datetime import datetime, timezone
 
 from app.season import PRIZES, SEASON_END_AT, format_countdown
-from app.services.game_modes import get_game_mode_name
 from app.services.heroes import get_hero_name
 
 
@@ -14,47 +13,22 @@ def format_nickname(player: dict) -> str:
 def format_home(player: dict, rating: dict | None, position: str) -> str:
     status = (
         f"{rating['current_rating']:.0f} TR · место {position}"
-        if rating else "Рейтинг пока не рассчитан. Нажмите «Мой рейтинг»."
+        if rating else "Рейтинг пока не рассчитан. Нажмите «Профиль»."
     )
-    return f"🏆 Turbo Rating\n\n{format_nickname(player)}\n{status}"
+    return f"Turbo Rating\n\n{format_nickname(player)}\n{status}"
 
 
-def format_rating(rating: dict, position: str, peak: float) -> str:
-    return (
-        "🏆 Мой рейтинг\n\n"
-        f"{rating['current_rating']:.0f} TR\n"
-        f"Место: {position}\n"
-        f"Старт: {rating['initial_rating']:.0f} TR\n"
-        f"Рекорд: {peak:.0f} TR"
-    )
-
-
-def format_profile(player: dict) -> str:
+def format_profile(player: dict, rating: dict, position: str, peak: float) -> str:
     connected = datetime.fromtimestamp(player["tracking_started_at"], timezone.utc).strftime("%d.%m.%Y")
     return (
-        f"👤 Профиль\n\n{format_nickname(player)}\n\n"
-        f"Dota ID: {player['account_id']}\n"
-        f"Подключён: {connected}"
+        f"👤 Профиль\n\n{format_nickname(player)}\n"
+        f"Dota ID: {player['account_id']}\n\n"
+        f"Turbo Rating: {rating['current_rating']:.0f} TR\n"
+        f"Место: {position}\n"
+        f"Стартовый TR: {rating['initial_rating']:.0f}\n"
+        f"Рекорд: {peak:.0f} TR\n\n"
+        f"Дата подключения:\n{connected}"
     )
-
-
-def format_history(
-    changes: dict[str, float], past_positions: dict[str, int | None],
-    current_position: str, history: list[dict],
-) -> str:
-    lines = ["📈 История TR", ""]
-    lines.extend(f"{label}: {change:+.0f} TR" for label, change in changes.items())
-    lines.append("")
-    for label, previous in past_positions.items():
-        movement = f"#{previous} → {current_position}" if previous is not None else "ещё не зарегистрирован"
-        lines.append(f"{label} назад: {movement}")
-    lines.extend(["", "Последние изменения:", ""])
-    for event in history:
-        date = datetime.fromtimestamp(event["created_at"], timezone.utc).strftime("%d.%m")
-        lines.append(f"{date}  {event['rating_delta']:+.0f}   {event['rating_after']:.0f} TR")
-    if not history:
-        lines.append("Начислений пока нет.")
-    return "\n".join(lines)
 
 
 def _rank_movement(before: int | None, current: int) -> str:
@@ -68,7 +42,7 @@ def format_top(
     leaderboard: list[dict], past_positions: dict[int, int],
     account_id: int | None, own_place: dict | None, *, at: datetime | None = None,
 ) -> str:
-    lines = ["🥇 Turbo Rating", ""]
+    lines = ["Turbo Rating", ""]
     if not leaderboard:
         lines.append("Рейтинг игроков пока пуст.")
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
@@ -108,13 +82,17 @@ def format_prizes(standings: list[dict], *, finished: bool = False, at: datetime
     return "\n".join(lines)
 
 
-def format_matches(matches: list[dict]) -> str:
+def format_matches(matches: list[dict], changes: dict[str, float]) -> str:
+    lines = ["📜 История матчей"]
     if not matches:
-        return "Матчей пока нет. Нажмите «Обновить» после игры."
-    lines = ["🎮 Последние матчи"]
+        lines.append("Матчей пока нет. Нажмите «Обновить» после игры.")
     for match in matches:
+        date = datetime.fromtimestamp(match["start_time"], timezone.utc).strftime("%d.%m")
         result = {1: "WIN", 0: "LOSE", None: "Результат пока неизвестен"}[match["win"]]
-        mode = get_game_mode_name(match["game_mode"])
-        duration = f"{match['duration'] / 60:.0f} мин" if match["duration"] is not None else "? мин"
-        lines.append(f"{result}\n{get_hero_name(match['hero_id'])} · {mode} · {duration}")
+        rating = (
+            f"{match['rating_delta']:+.0f} TR → {match['rating_after']:.0f} TR"
+            if match["rating_delta"] is not None else "TR не начислен."
+        )
+        lines.append(f"{date}\n{result} · {get_hero_name(match['hero_id'])}\n{rating}")
+    lines.append("\n".join(f"{label}: {change:+.0f} TR" for label, change in changes.items()))
     return "\n\n".join(lines)

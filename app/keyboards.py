@@ -14,7 +14,7 @@ PROFILE_BUTTON = "👤 Профиль"
 LINK_BUTTON = "➕ Привязать Dota"
 CHANGE_BUTTON = "🔁 Сменить Dota"
 SHARE_BUTTON = "🔗 Поделиться"
-HISTORY_BUTTON = "📈 История"
+HISTORY_BUTTON = "📜 История матчей"
 PRIZES_BUTTON = "💰 Призы"
 CHANGE_CONFIRM_PREFIX = "dota_change:confirm:"
 CHANGE_CANCEL_PREFIX = "dota_change:cancel:"
@@ -26,11 +26,10 @@ LINK_RETRY_PREFIX = "dota_link:retry:"
 
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
-        [KeyboardButton(text=RATING_BUTTON), KeyboardButton(text=TOP_BUTTON)],
-        [KeyboardButton(text=HISTORY_BUTTON), KeyboardButton(text=MATCHES_BUTTON)],
-        [KeyboardButton(text=SYNC_BUTTON), KeyboardButton(text=PROFILE_BUTTON)],
-        [KeyboardButton(text=PRIZES_BUTTON)],
-        [KeyboardButton(text=RATING_HELP_BUTTON)],
+        [KeyboardButton(text=PROFILE_BUTTON), KeyboardButton(text=TOP_BUTTON)],
+        [KeyboardButton(text=HISTORY_BUTTON), KeyboardButton(text=PRIZES_BUTTON)],
+        [KeyboardButton(text=SYNC_BUTTON), KeyboardButton(text=RATING_HELP_BUTTON)],
+        [KeyboardButton(text=CHANGE_BUTTON)],
     ],
     resize_keyboard=True,
     is_persistent=True,

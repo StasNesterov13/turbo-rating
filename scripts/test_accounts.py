@@ -222,7 +222,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         unlinked = (await self.send("/start", user_id=202))[0]
         self.assertEqual(linked.reply_markup, MAIN_KEYBOARD)
         self.assertEqual(unlinked.reply_markup, UNLINKED_KEYBOARD)
-        self.assertNotIn(CHANGE_BUTTON, [b.text for row in linked.reply_markup.keyboard for b in row])
+        self.assertIn(CHANGE_BUTTON, [b.text for row in linked.reply_markup.keyboard for b in row])
         self.assertNotIn(LINK_BUTTON, [b.text for row in linked.reply_markup.keyboard for b in row])
         confirmation = (await self.send(CHANGE_BUTTON))[0]
         self.assertEqual(confirmation.text,
@@ -438,15 +438,12 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         await self.send("/add 43")
         for command in ("/profile", "/rating", "/stats"):
             response = (await self.send(command))[0].text
-            if command == "/profile":
-                self.assertIn("Player 43", response)
-                self.assertIn("Dota ID: 43", response)
-                self.assertNotIn("1070", response)
-            else:
-                self.assertIn("1070", response)
+            self.assertIn("Player 43", response)
+            self.assertIn("Dota ID: 43", response)
+            self.assertIn("1070", response)
             self.assertNotIn("Old Player", response)
         top = (await self.send("/top"))[0].text
-        self.assertEqual(top.split("\n\n💰 Призы:")[0], "🥇 Turbo Rating\n\n🥇 Player 43 — 1070 ← вы")
+        self.assertEqual(top.split("\n\n💰 Призы:")[0], "Turbo Rating\n\n🥇 Player 43 — 1070 ← вы")
         self.assertIsNone(db.get_leaderboard_position(42))
         self.assertEqual(db.get_tracked_account_ids(), [43])
         with patch("app.autosync.sync_player", new=AsyncMock(return_value=SyncResult(0, []))) as sync:

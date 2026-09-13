@@ -32,7 +32,7 @@ from app.services.heroes import load_heroes
 from app.services.sync import MatchHistoryUnavailable, sync_player
 from app.services.rating import initialize_rating
 from app.screens import (
-    format_home, format_rating, format_history, format_top, format_matches,
+    format_home, format_top, format_matches,
     format_profile, format_nickname as _nickname, format_prizes, format_season_results,
 )
 
@@ -78,20 +78,17 @@ CHANGE_PROMPT = "Смена Dota-профиля\n\nОтправь новый к�
 CHANGE_CANCELLED_MESSAGE = "Смена аккаунта отменена."
 INVALID_ACCOUNT_MESSAGE = "Не удалось определить Dota аккаунт.\n\nОтправь код друга Steam — только цифры, например:\n165682118"
 ONBOARDING_MESSAGE = (
-    "🏆 Turbo Rating\n\n"
+    "Turbo Rating\n\n"
     "Рейтинг Turbo-игр среди друзей.\n\n"
     "Чтобы начать, привяжите Dota-профиль."
 )
 RATING_HELP_MESSAGE = (
-    "🏆 Как считается Turbo Rating\n\n"
-    "Стартовый TR считается по последним 20 Turbo.\n\n"
+    "Turbo Rating\n\n"
+    "Стартовый TR рассчитывается по последним 20 Turbo-матчам.\n\n"
     "После подключения:\n\n"
-    "1000 TR → WIN +16 / LOSE -12\n"
-    "1400 TR → WIN +20 / LOSE -14\n"
-    "1800 TR → WIN +24 / LOSE -16\n"
-    "2000 TR → WIN +26 / LOSE -17\n\n"
-    "Чем выше TR, тем больше очков даёт победа.\n"
-    "Победа всегда ценнее поражения."
+    "WIN → +25 TR\n"
+    "LOSE → -25 TR\n\n"
+    "На рейтинг влияет только результат Turbo-матча."
 )
 
 
@@ -107,11 +104,11 @@ class ChangeDota(StatesGroup):
 BOT_COMMANDS = [
     BotCommand(command="start", description="Начать работу"),
     BotCommand(command="add", description="Подключить Dota аккаунт"),
-    BotCommand(command="rating", description="Мой рейтинг"),
-    BotCommand(command="history", description="История и движение в топе"),
+    BotCommand(command="rating", description="Профиль"),
+    BotCommand(command="history", description="История матчей"),
     BotCommand(command="top", description="Таблица лидеров"),
     BotCommand(command="prizes", description="Призы сезона"),
-    BotCommand(command="matches", description="Последние матчи"),
+    BotCommand(command="matches", description="История матчей"),
     BotCommand(command="sync", description="Обновить матчи"),
     BotCommand(command="profile", description="Мой профиль"),
 ]
@@ -197,7 +194,7 @@ async def share_command(message: Message, state: FSMContext | None = None) -> No
     await _exit_account_input(message, state)
     me = await message.bot.me()
     await message.answer(
-        f"🏆 Turbo Rating — рейтинг Turbo среди друзей.\nПрисоединяйся: https://t.me/{me.username}",
+        f"Turbo Rating — рейтинг Turbo среди друзей.\nПрисоединяйся: https://t.me/{me.username}",
         reply_markup=get_main_keyboard(_player(message) is not None),
     )
 
@@ -429,16 +426,6 @@ async def prizes_command(message: Message, state: FSMContext | None = None) -> N
     )
 
 
-@router.message(Command("profile"))
-@router.message(F.text == PROFILE_BUTTON)
-async def profile_command(message: Message, state: FSMContext | None = None) -> None:
-    player = await _linked_player(message, state)
-    if player is None:
-        return
-
-    await message.answer(format_profile(player), reply_markup=MAIN_KEYBOARD)
-
-
 async def _load_rating(message: Message, account_id: int, api_key: str | None):
     try:
         rating = await initialize_rating(account_id, api_key=api_key)
@@ -450,23 +437,26 @@ async def _load_rating(message: Message, account_id: int, api_key: str | None):
         return None
 
 
-@router.message(Command("rating", "stats"))
-@router.message(F.text.in_({RATING_BUTTON, "🏆 Рейтинг", STATS_BUTTON}))
-async def rating_command(message: Message, api_key: str | None = None, state: FSMContext | None = None) -> None:
+@router.message(Command("profile", "rating", "stats"))
+@router.message(F.text.in_({PROFILE_BUTTON, RATING_BUTTON, "🏆 Рейтинг", STATS_BUTTON}))
+async def profile_command(message: Message, api_key: str | None = None, state: FSMContext | None = None) -> None:
     player = await _linked_player(message, state)
     if player is None:
         return
     rating = await _load_rating(message, player["account_id"], api_key)
     if rating is None:
         return
-    text = format_rating(
-        rating, _position(player['account_id']), db.get_peak_rating(player['account_id']),
+    text = format_profile(
+        player, rating, _position(player['account_id']), db.get_peak_rating(player['account_id']),
     )
     await message.answer(text, reply_markup=MAIN_KEYBOARD)
 
 
-@router.message(Command("history"))
-@router.message(F.text == HISTORY_BUTTON)
+rating_command = profile_command
+
+
+@router.message(Command("matches", "history"))
+@router.message(F.text.in_({HISTORY_BUTTON, MATCHES_BUTTON, "📈 История", "📈 История TR"}))
 async def history_command(message: Message, api_key: str | None = None, state: FSMContext | None = None) -> None:
     player = await _linked_player(message, state)
     if player is None:
@@ -476,24 +466,14 @@ async def history_command(message: Message, api_key: str | None = None, state: F
     if rating is None:
         return
     cutoffs = _history_cutoffs()
-    current_place = _position(account_id)
     changes = {label: db.get_rating_change(account_id, since) for label, since in cutoffs.items()}
-    past_positions = {label: db.get_rank_at(account_id, cutoffs[label]) for label in ("7 дней", "30 дней")}
-    history = db.get_rating_history(account_id, limit=10, by_recorded_time=True)
+    matches = db.get_turbo_match_history(account_id, limit=10)
     await message.answer(
-        format_history(changes, past_positions, current_place, history), reply_markup=MAIN_KEYBOARD,
+        format_matches(matches, changes), reply_markup=MAIN_KEYBOARD,
     )
 
 
-@router.message(Command("matches"))
-@router.message(F.text == MATCHES_BUTTON)
-async def matches_command(message: Message, state: FSMContext | None = None) -> None:
-    player = await _linked_player(message, state)
-    if player is None:
-        return
-
-    matches = db.get_player_matches(player["account_id"], limit=5)
-    await message.answer(format_matches(matches), reply_markup=MAIN_KEYBOARD)
+matches_command = history_command
 
 
 @router.message(Command("sync"))
