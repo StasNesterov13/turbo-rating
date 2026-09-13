@@ -2,7 +2,7 @@
 
 import asyncio
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import logging
 import math
 import sqlite3
@@ -24,7 +24,7 @@ from app.keyboards import (
     STATS_BUTTON, TOP_BUTTON, MATCHES_BUTTON, SYNC_BUTTON, PROFILE_BUTTON, LINK_BUTTON,
     VIEW_TOP_BUTTON, RATING_HELP_BUTTON,
     CHANGE_BUTTON, CHANGE_CONFIRM_PREFIX, CHANGE_CANCEL_PREFIX, get_change_keyboard,
-    SHARE_BUTTON,
+    SHARE_BUTTON, HISTORY_BUTTON,
 )
 from app.services.accounts import InvalidDotaAccountError, link_dota_account
 from app.services.heroes import get_hero_name, load_heroes
@@ -88,6 +88,7 @@ BOT_COMMANDS = [
     BotCommand(command="start", description="Начать работу"),
     BotCommand(command="add", description="Подключить Dota аккаунт"),
     BotCommand(command="rating", description="Рейтинг и последние игры"),
+    BotCommand(command="history", description="История TR и движение в топе"),
     BotCommand(command="stats", description="Статистика Turbo"),
     BotCommand(command="top", description="Таблица лидеров"),
     BotCommand(command="matches", description="Последние матчи"),
@@ -121,6 +122,22 @@ def _position(account_id: int) -> str:
     return f"#{place['position']}" if place else "пока нет"
 
 
+def _history_cutoffs() -> dict[str, int]:
+    now = datetime.now(timezone.utc)
+    return {
+        "Сегодня": int(now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()),
+        "7 дней": int((now - timedelta(days=7)).timestamp()),
+        "30 дней": int((now - timedelta(days=30)).timestamp()),
+    }
+
+
+def _rank_movement(before: int | None, current: int) -> str:
+    if before is None:
+        return ""
+    change = before - current
+    return f"  ↑{change}" if change > 0 else f"  ↓{-change}" if change < 0 else "  —"
+
+
 def _form_text(account_id: int, *, with_streak: bool = False) -> str:
     form = db.get_turbo_form(account_id)
     text = "Последние:\n" + (" ".join(form["results"]) or "пока нет игр")
@@ -146,16 +163,19 @@ def _leaderboard(account_id: int | None) -> str:
     if not leaderboard:
         return "Рейтинг игроков пока пуст."
     lines = []
+    past_positions = {row["account_id"]: row["position"] for row in db.get_leaderboard_at(_history_cutoffs()["7 дней"])}
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     for position, player in enumerate(leaderboard, start=1):
         suffix = " ← вы" if player["account_id"] == account_id else ""
+        movement = _rank_movement(past_positions.get(player["account_id"]), position)
         lines.append(
             f"{medals.get(position, f'{position}.')} {_nickname(player)} — "
-            f"{player['current_rating']:.0f}{suffix}"
+            f"{player['current_rating']:.0f}{movement}{suffix}"
         )
     place = db.get_leaderboard_position(account_id) if account_id is not None else None
     if place and place["position"] > len(leaderboard):
-        lines.extend(["", f"Ваше место: #{place['position']} — {place['current_rating']:.0f} TR"])
+        movement = _rank_movement(past_positions.get(account_id), place["position"])
+        lines.extend(["", f"Ваше место: #{place['position']} — {place['current_rating']:.0f} TR{movement}"])
     return "\n".join(lines)
 
 
@@ -411,7 +431,10 @@ async def rating_command(message: Message, api_key: str | None = None, state: FS
     stats = db.get_turbo_stats(player["account_id"])
     text = (
         f"🏆 Мой рейтинг\n\n{_nickname(player)}\n\n"
-        f"{rating['current_rating']:.0f} TR\nМесто: {_position(player['account_id'])}\n\n"
+        f"{rating['current_rating']:.0f} TR\n"
+        f"Рекорд: {db.get_peak_rating(player['account_id']):.0f} TR\n"
+        f"7 дней: {db.get_rating_change(player['account_id'], _history_cutoffs()['7 дней']):+.0f} TR\n"
+        f"Место: {_position(player['account_id'])}\n\n"
         f"Старт: {rating['initial_rating']:.0f}\n"
         f"Изменение: {rating['current_rating'] - rating['initial_rating']:+.0f}\n\n"
         "Turbo после регистрации:\n"
@@ -423,14 +446,41 @@ async def rating_command(message: Message, api_key: str | None = None, state: FS
     if stats["unknown"]:
         text += f"\nБез результата: {stats['unknown']}"
     text += f"\n\n{_form_text(player['account_id'], with_streak=True)}"
-    history = db.get_rating_history(player["account_id"], limit=5)
-    if history:
-        text += "\n\nПоследние изменения:\n\n" + "\n".join(
-            f"{game['rating_delta']:+.0f}  {get_hero_name(game['hero_id'])}" for game in history
-        )
-    else:
-        text += "\n\nПосле регистрации пока нет учтённых Turbo-матчей."
+    text += "\n\nПодробная история — «📈 История TR»."
     await message.answer(text, reply_markup=MAIN_KEYBOARD)
+
+
+@router.message(Command("history"))
+@router.message(F.text == HISTORY_BUTTON)
+async def history_command(message: Message, api_key: str | None = None, state: FSMContext | None = None) -> None:
+    player = await _linked_player(message, state)
+    if player is None:
+        return
+    account_id = player["account_id"]
+    rating = await _load_rating(message, account_id, api_key)
+    if rating is None:
+        return
+    cutoffs = _history_cutoffs()
+    current_place = _position(account_id)
+    lines = [
+        "📈 История TR", "", _nickname(player), "",
+        f"Сейчас: {rating['current_rating']:.0f} TR",
+        f"Рекорд: {db.get_peak_rating(account_id):.0f} TR", "",
+    ]
+    lines.extend(f"{label}: {db.get_rating_change(account_id, since):+.0f} TR" for label, since in cutoffs.items())
+    lines.extend(["", f"Место сейчас: {current_place}"])
+    for label in ("7 дней", "30 дней"):
+        previous = db.get_rank_at(account_id, cutoffs[label])
+        movement = f"#{previous} → {current_place}" if previous is not None else "ещё не зарегистрирован"
+        lines.append(f"{label} назад: {movement}")
+    lines.extend(["", "Последние изменения:", ""])
+    history = db.get_rating_history(account_id, limit=10, by_recorded_time=True)
+    for event in history:
+        date = datetime.fromtimestamp(event["created_at"], timezone.utc).strftime("%d.%m")
+        lines.append(f"{date}  {event['rating_delta']:+.0f}   {event['rating_after']:.0f} TR")
+    if not history:
+        lines.append("Начислений пока нет.")
+    await message.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(Command("stats"))

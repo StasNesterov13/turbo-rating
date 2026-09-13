@@ -321,12 +321,16 @@ def apply_pending_ratings(
     return changes
 
 
-def get_rating_history(account_id: int, limit: int | None = None) -> list[dict[str, Any]]:
+def get_rating_history(
+    account_id: int, limit: int | None = None, *, by_recorded_time: bool = False,
+) -> list[dict[str, Any]]:
     query = """
         SELECT h.*, m.hero_id, m.start_time FROM rating_history h
         JOIN matches m ON m.account_id = h.account_id AND m.match_id = h.match_id
-        WHERE h.account_id = ? ORDER BY m.start_time DESC, m.match_id DESC
+        WHERE h.account_id = ?
     """
+    order = "h.created_at DESC, h.rowid DESC" if by_recorded_time else "m.start_time DESC, m.match_id DESC"
+    query += " ORDER BY " + order
     parameters = [account_id]
     if limit is not None:
         query += " LIMIT ?"
@@ -447,3 +451,70 @@ def get_turbo_form(account_id: int) -> dict[str, Any]:
             elif len(results) == 5:
                 break
     return {"results": results, "streak": streak, "streak_win": streak_win}
+
+
+# The event timestamp is when TR was recorded, including delayed syncs. Within
+# one second, rowid preserves the actual insertion order, including backfills.
+_RATING_AT_QUERY = """
+    SELECT p.account_id, p.nickname,
+        COALESCE((
+            SELECT h.rating_after FROM rating_history h
+            WHERE h.account_id = r.account_id AND h.created_at <= :timestamp
+            ORDER BY h.created_at DESC, h.rowid DESC LIMIT 1
+        ), r.initial_rating) AS rating
+    FROM ratings r JOIN players p ON p.account_id = r.account_id
+    WHERE p.tracking_started_at <= :timestamp
+"""
+
+
+def get_rating_at(account_id: int, timestamp: int) -> float | None:
+    """Saved TR at/before timestamp; None before registration or without a rating."""
+    with _connect() as connection:
+        row = connection.execute(
+            _RATING_AT_QUERY + " AND p.account_id = :account_id",
+            {"account_id": account_id, "timestamp": timestamp},
+        ).fetchone()
+    return row["rating"] if row is not None else None
+
+
+def get_leaderboard_at(timestamp: int) -> list[dict[str, Any]]:
+    """Reconstruct every currently active player's rank, without a top-20 limit."""
+    with _connect() as connection:
+        rows = connection.execute(
+            _RATING_AT_QUERY + """
+                AND EXISTS (SELECT 1 FROM telegram_users t WHERE t.account_id = p.account_id)
+                ORDER BY rating DESC, p.account_id ASC
+            """, {"timestamp": timestamp},
+        ).fetchall()
+    return [{**dict(row), "position": position} for position, row in enumerate(rows, 1)]
+
+
+def get_rank_at(account_id: int, timestamp: int) -> int | None:
+    return next((row["position"] for row in get_leaderboard_at(timestamp)
+                 if row["account_id"] == account_id), None)
+
+
+def get_peak_rating(account_id: int) -> float | None:
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT MAX(r.initial_rating, COALESCE(MAX(h.rating_after), r.initial_rating)) AS peak
+            FROM ratings r LEFT JOIN rating_history h ON h.account_id = r.account_id
+            WHERE r.account_id = ? GROUP BY r.account_id
+            """, (account_id,),
+        ).fetchone()
+    return row["peak"] if row is not None else None
+
+
+def get_rating_change(account_id: int, since_timestamp: int) -> float | None:
+    """Sum saved changes since the boundary (inclusive); initialization is not a gain."""
+    with _connect() as connection:
+        row = connection.execute(
+            """
+            SELECT COALESCE(SUM(h.rating_delta), 0.0) AS change
+            FROM ratings r LEFT JOIN rating_history h
+                ON h.account_id = r.account_id AND h.created_at >= ?
+            WHERE r.account_id = ? GROUP BY r.account_id
+            """, (since_timestamp, account_id),
+        ).fetchone()
+    return row["change"] if row is not None else None

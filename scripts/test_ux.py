@@ -21,7 +21,7 @@ if __package__ in (None, ""):
 
 from app import db
 from app.keyboards import (
-    MAIN_KEYBOARD, UNLINKED_KEYBOARD, LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON, CHANGE_BUTTON, SHARE_BUTTON,
+    MAIN_KEYBOARD, UNLINKED_KEYBOARD, LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON, CHANGE_BUTTON, SHARE_BUTTON, HISTORY_BUTTON,
 )
 from app.notifications import format_rating_updates, notify_rating_updates
 from app.services import heroes, sync as sync_service
@@ -256,11 +256,12 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         for start, end, position in ((1053, 1070, "#4 → #3"), (1050, 1053, "#4"),
                                      (1053, 1055, "#4 → #3"), (1070, 1053, "#3 → #4")):
             await notify_rating_updates(bot, 42, [RatingUpdate(1, 1001, 44, end > start, start, end - start, end)])
-            self.assertTrue(bot.send_message.await_args.args[1].endswith(f"Место: {position}"))
+            prefix = "Место:\n" if "→" in position else "Место: "
+            self.assertTrue(bot.send_message.await_args.args[1].endswith(prefix + position))
         self.assertEqual((db.get_rating(42), db.get_rating_history(42)), before)
         self.assertEqual(format_rating_updates(
             [RatingUpdate(1, 1001, 44, True, 1053, 17, 1070)], position_before=4, position_after=3,
-        ), "🟢 Победа · Phantom Assassin\n\n+17 TR\n1053 → 1070\n\nМесто: #4 → #3")
+        ), "🟢 Победа в Turbo\n\n+17 TR\n1053 → 1070\n\nМесто:\n#4 → #3")
 
     async def test_stats_only_turbo_since_tracking_without_calibration(self):
         for game in (match(1, 1000), match(2, 1001), match(3, 1002, False),
@@ -278,7 +279,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         self.assertAlmostEqual(stats["winrate"], 200 / 3)
         self.assertEqual(db.get_turbo_stats(999)["winrate"], 0)
 
-    async def test_last_five_ratings_have_hero_names_without_recalculation(self):
+    async def test_rating_summary_links_to_history_without_recalculation(self):
         from app.bot import rating_command
         for index in range(1, 7):
             game = match(index, 1000 + index, index % 2 == 0)
@@ -296,8 +297,10 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
             await rating_command(message)
             await rating_command(message)
         text = message.answer.await_args.args[0]
-        self.assertEqual(text.count("Phantom Assassin"), 3)
-        self.assertEqual(text.count("Pudge"), 2)
+        self.assertIn("Рекорд:", text)
+        self.assertIn("7 дней:", text)
+        self.assertIn(HISTORY_BUTTON, text)
+        self.assertNotIn("Последние изменения:", text)
         self.assertEqual((db.get_rating(42), db.get_rating_history(42)), before)
 
     async def test_leaderboard_position_stable_ties_and_below_top_twenty(self):
@@ -316,7 +319,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Ваше место: #27 — 1000 TR", message.answer.await_args.args[0])
         db.link_telegram_user(101, 3)
         await top_command(message)
-        self.assertIn("🥉 Player 3 — 1000 ← вы", message.answer.await_args.args[0])
+        self.assertIn("🥉 Player 3 — 1000  — ← вы", message.answer.await_args.args[0])
 
     async def test_commands_and_buttons_through_dispatcher(self):
         from app import bot as bot_module
@@ -352,7 +355,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     response = await send(command)
                     self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
                 buttons = [button.text for row in MAIN_KEYBOARD.keyboard for button in row]
-                self.assertEqual(buttons, ["🏆 Мой рейтинг", "🥇 Топ игроков", "📊 Статистика", "🎮 Матчи", "🔄 Обновить", "👤 Профиль", CHANGE_BUTTON, SHARE_BUTTON, RATING_HELP_BUTTON])
+                self.assertEqual(buttons, ["🏆 Мой рейтинг", "🥇 Топ игроков", "📊 Статистика", "🎮 Матчи", "🔄 Обновить", "👤 Профиль", HISTORY_BUTTON, CHANGE_BUTTON, SHARE_BUTTON, RATING_HELP_BUTTON])
                 for button, command in zip(buttons, ("/rating", "/top", "/stats", "/matches", "/sync", "/profile")):
                     self.assertEqual((await send(button)).text, (await send(command)).text)
                 self.assertEqual(sync.await_count, 2)
@@ -381,20 +384,21 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
                 self.assertEqual((await send("🏆 Рейтинг")).text, (await send("/rating")).text)
                 self.assertEqual((await send("🥇 Топ")).text, (await send("/top")).text)
+                self.assertEqual((await send(HISTORY_BUTTON)).text, (await send("/history")).text)
                 shared = await send(SHARE_BUTTON)
                 self.assertEqual(shared.text,
                                  "🏆 Turbo Rating — рейтинг Turbo среди друзей.\nПрисоединяйся: https://t.me/turbo_rating_test_bot")
                 self.assertEqual(shared.reply_markup, MAIN_KEYBOARD)
         self.assertEqual([cmd.command for cmd in bot_module.BOT_COMMANDS],
-                         ["start", "add", "rating", "stats", "top", "matches", "sync", "profile"])
+                         ["start", "add", "rating", "history", "stats", "top", "matches", "sync", "profile"])
 
     async def test_named_notifications_and_length_with_long_names(self):
         win = RatingUpdate(1, 1001, 44, True, 1000, 16, 1016)
         loss = RatingUpdate(2, 1002, 14, False, 1016, -17, 999)
         self.assertEqual(format_rating_updates([win]),
-                         "🟢 Победа · Phantom Assassin\n\n+16 TR\n1000 → 1016")
+                         "🟢 Победа в Turbo\n\n+16 TR\n1000 → 1016")
         self.assertEqual(format_rating_updates([loss]),
-                         "🔴 Поражение · Pudge\n\n-17 TR\n1016 → 999")
+                         "🔴 Поражение в Turbo\n\n-17 TR\n1016 → 999")
         group = format_rating_updates([win, loss])
         self.assertIn("🟢 Phantom Assassin  +16 TR", group)
         self.assertIn("🔴 Pudge  -17 TR", group)

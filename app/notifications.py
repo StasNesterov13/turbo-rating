@@ -22,13 +22,15 @@ def format_rating_updates(
     before, after = updates[0].rating_before, updates[-1].rating_after
     position = ""
     if position_after is not None:
-        change = f"#{position_before} → " if position_before is not None and position_before != position_after else ""
-        position = f"\n\nМесто: {change}#{position_after}"
+        if position_before is not None and position_before != position_after:
+            position = f"\n\nМесто:\n#{position_before} → #{position_after}"
+        else:
+            position = f"\n\nМесто: #{position_after}"
     if len(updates) == 1 and not manual:
         update = updates[0]
-        title = "🟢 Победа" if update.win else "🔴 Поражение"
+        title = "🟢 Победа в Turbo" if update.win else "🔴 Поражение в Turbo"
         return (
-            f"{title} · {get_hero_name(update.hero_id)}\n\n"
+            f"{title}\n\n"
             f"{update.rating_delta:+.0f} TR\n{before:.0f} → {after:.0f}{position}"
         )
 

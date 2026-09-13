@@ -280,9 +280,8 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
     async def test_notification_formats_and_bounded_message_length(self):
         win = RatingUpdate(1, 1001, 44, True, 1000, 16, 1016)
         loss = RatingUpdate(2, 1002, 14, False, 1016, -16.73630679352, 999.26369320648)
-        self.assertIn("🟢 Победа ·", format_rating_updates([win]))
-        self.assertIn("🔴 Поражение ·", format_rating_updates([loss]))
-        self.assertIn("Hero #44", format_rating_updates([win]))
+        self.assertIn("🟢 Победа в Turbo", format_rating_updates([win]))
+        self.assertIn("🔴 Поражение в Turbo", format_rating_updates([loss]))
         self.assertIn("🟢 Turbo WIN: Hero #44  +16 TR", format_rating_updates([win, loss], manual=True))
         self.assertIn("Rating: 1000 → 999", format_rating_updates([win, loss]))
         self.assertEqual(format_rating_updates([]), "")
@@ -312,7 +311,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         db.link_telegram_user(103, 43)
         message.answer.reset_mock()
         await top_command(message)
-        self.assertEqual(message.answer.await_args.args[0], "🥇 Turbo Rating\n\n🥇 Player 43 — 1200\n🥈 Test Player — 1000 ← вы")
+        self.assertEqual(message.answer.await_args.args[0], "🥇 Turbo Rating\n\n🥇 Player 43 — 1200  —\n🥈 Test Player — 1000  — ← вы")
         self.fetch.return_value = [match(2, 1002, False), match(1, 1001)]
         message.answer.reset_mock()
         with patch("app.notifications.notify_rating_updates", new=AsyncMock()) as notify:

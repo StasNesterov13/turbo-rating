@@ -14,6 +14,7 @@ PROFILE_BUTTON = "👤 Профиль"
 LINK_BUTTON = "➕ Привязать Dota"
 CHANGE_BUTTON = "🔁 Сменить Dota"
 SHARE_BUTTON = "🔗 Поделиться"
+HISTORY_BUTTON = "📈 История TR"
 CHANGE_CONFIRM_PREFIX = "dota_change:confirm:"
 CHANGE_CANCEL_PREFIX = "dota_change:cancel:"
 VIEW_TOP_BUTTON = "🥇 Посмотреть топ"
@@ -24,6 +25,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(text=RATING_BUTTON), KeyboardButton(text=TOP_BUTTON)],
         [KeyboardButton(text=STATS_BUTTON), KeyboardButton(text=MATCHES_BUTTON)],
         [KeyboardButton(text=SYNC_BUTTON), KeyboardButton(text=PROFILE_BUTTON)],
+        [KeyboardButton(text=HISTORY_BUTTON)],
         [KeyboardButton(text=CHANGE_BUTTON), KeyboardButton(text=SHARE_BUTTON)],
         [KeyboardButton(text=RATING_HELP_BUTTON)],
     ],
