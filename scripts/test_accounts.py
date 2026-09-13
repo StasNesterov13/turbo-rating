@@ -32,6 +32,7 @@ from scripts.test_rating import match
 
 class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         from app import bot as bot_module
         self.module = importlib.reload(bot_module)
         temporary = tempfile.TemporaryDirectory(prefix="turbo-accounts-test-")
@@ -329,7 +330,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("1070", response)
             self.assertNotIn("Old Player", response)
         top = (await self.send("/top"))[0].text
-        self.assertEqual(top, "🥇 Turbo Rating\n\n🥇 Player 43 — 1070 ← вы")
+        self.assertEqual(top.split("\n\n💰 Призы:")[0], "🥇 Turbo Rating\n\n🥇 Player 43 — 1070 ← вы")
         self.assertIsNone(db.get_leaderboard_position(42))
         self.assertEqual(db.get_tracked_account_ids(), [43])
         with patch("app.autosync.sync_player", new=AsyncMock(return_value=SyncResult(0, []))) as sync:

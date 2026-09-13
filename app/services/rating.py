@@ -40,12 +40,13 @@ def calculate_new_rating(rating: float, win: bool) -> tuple[float, float, float]
 
 async def initialize_rating(
     account_id: int, *, api_key: str | None = None
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     player = db.get_player(account_id)
     if player is None:
         raise ValueError("Игрок ещё не добавлен в БД.")
+    final = db.get_final_standings()
     existing = db.get_rating(account_id)
-    if existing is not None:
+    if existing is not None or final is not None:
         return existing
 
     async with OpenDotaClient(

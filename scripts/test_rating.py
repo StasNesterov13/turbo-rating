@@ -99,6 +99,7 @@ class MathematicsTests(unittest.TestCase):
 
 class RatingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         temporary = tempfile.TemporaryDirectory(prefix="turbo-rating-test-")
         self.addCleanup(temporary.cleanup)
         self.enterContext(patch.object(db, "DB_PATH", Path(temporary.name) / "data" / "test.db"))
@@ -387,6 +388,7 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
 
 class MigrationTests(unittest.TestCase):
     def test_legacy_database_is_preserved(self):
+        self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         with tempfile.TemporaryDirectory(prefix="turbo-migration-test-") as directory:
             with patch.object(db, "DB_PATH", Path(directory) / "legacy.db"):
                 with closing(sqlite3.connect(db.DB_PATH)) as connection:

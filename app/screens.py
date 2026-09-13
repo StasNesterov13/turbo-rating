@@ -2,6 +2,7 @@
 
 from datetime import datetime, timezone
 
+from app.season import PRIZES, SEASON_END_AT, format_countdown
 from app.services.game_modes import get_game_mode_name
 from app.services.heroes import get_hero_name
 
@@ -65,11 +66,11 @@ def _rank_movement(before: int | None, current: int) -> str:
 
 def format_top(
     leaderboard: list[dict], past_positions: dict[int, int],
-    account_id: int | None, own_place: dict | None,
+    account_id: int | None, own_place: dict | None, *, at: datetime | None = None,
 ) -> str:
     lines = ["🥇 Turbo Rating", ""]
     if not leaderboard:
-        return "\n".join([*lines, "Рейтинг игроков пока пуст."])
+        lines.append("Рейтинг игроков пока пуст.")
     medals = {1: "🥇", 2: "🥈", 3: "🥉"}
     for position, player in enumerate(leaderboard, start=1):
         suffix = " ← вы" if player["account_id"] == account_id else ""
@@ -81,6 +82,31 @@ def format_top(
     if own_place and own_place["position"] > len(leaderboard):
         movement = _rank_movement(past_positions.get(account_id), own_place["position"])
         lines.extend(["", f"Ваше место: #{own_place['position']} — {own_place['current_rating']:.0f} TR{movement}"])
+    lines.extend(["", "💰 Призы: " + " / ".join(f"{amount} ₽" for amount in PRIZES.values()),
+                  f"До конца сезона: {format_countdown(at)}"])
+    return "\n".join(lines)
+
+
+def _podium(standings: list[dict], *, prizes: bool = False) -> list[str]:
+    lines = []
+    for position, (medal, player) in enumerate(zip(("🥇", "🥈", "🥉"), standings), start=1):
+        prize = f" — {PRIZES[position]:,} ₽".replace(",", " ") if prizes else ""
+        lines.append(f"{medal} {format_nickname(player)} — {player['current_rating']:.0f} TR{prize}")
+    return lines or ["Рейтинг игроков пока пуст."]
+
+
+def format_season_results(standings: list[dict]) -> str:
+    return "\n".join(["🏆 Итоги сезона", "", *_podium(standings)])
+
+
+def format_prizes(standings: list[dict], *, finished: bool = False, at: datetime | None = None) -> str:
+    lines = ["💰 Призы сезона", ""]
+    if finished:
+        return "\n".join([*lines, "Сезон завершён.", "", "Победители:", *_podium(standings, prizes=True)])
+    for position, medal in enumerate(("🥇", "🥈", "🥉"), start=1):
+        lines.append(f"{medal} {position} место — {PRIZES[position]:,} ₽".replace(",", " "))
+    lines.extend(["", "Сезон заканчивается:", f"{SEASON_END_AT.day} октября {SEASON_END_AT.year}",
+                  "", "До окончания:", format_countdown(at), "", "Текущий топ:", *_podium(standings)])
     return "\n".join(lines)
 
 

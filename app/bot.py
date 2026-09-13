@@ -17,14 +17,14 @@ from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import BotCommand, CallbackQuery, Message
 import httpx
 
-from app import db
+from app import db, season
 from app.autosync import run_autosync
 from app.keyboards import (
     MAIN_KEYBOARD, UNLINKED_KEYBOARD, get_main_keyboard, RATING_BUTTON,
     STATS_BUTTON, TOP_BUTTON, MATCHES_BUTTON, SYNC_BUTTON, PROFILE_BUTTON, LINK_BUTTON,
     VIEW_TOP_BUTTON, RATING_HELP_BUTTON,
     CHANGE_BUTTON, CHANGE_CONFIRM_PREFIX, CHANGE_CANCEL_PREFIX, get_change_keyboard,
-    SHARE_BUTTON, HISTORY_BUTTON,
+    SHARE_BUTTON, HISTORY_BUTTON, PRIZES_BUTTON,
 )
 from app.services.accounts import InvalidDotaAccountError, link_dota_account
 from app.services.heroes import load_heroes
@@ -32,7 +32,7 @@ from app.services.sync import MatchHistoryUnavailable, sync_player
 from app.services.rating import initialize_rating
 from app.screens import (
     format_home, format_rating, format_history, format_top, format_matches,
-    format_profile, format_nickname as _nickname,
+    format_profile, format_nickname as _nickname, format_prizes, format_season_results,
 )
 
 
@@ -81,6 +81,7 @@ BOT_COMMANDS = [
     BotCommand(command="rating", description="Мой рейтинг"),
     BotCommand(command="history", description="История TR и движение в топе"),
     BotCommand(command="top", description="Таблица лидеров"),
+    BotCommand(command="prizes", description="Призы сезона"),
     BotCommand(command="matches", description="Последние матчи"),
     BotCommand(command="sync", description="Обновить матчи"),
     BotCommand(command="profile", description="Мой профиль"),
@@ -116,12 +117,16 @@ def _service_error(exc: Exception, fallback: str) -> str:
 
 
 def _leaderboard(account_id: int | None) -> str:
+    at = season.now()
     leaderboard = db.get_leaderboard()
+    final = db.get_final_standings()
+    if final is not None:
+        return format_season_results(final)
     if not leaderboard:
-        return format_top([], {}, account_id, None)
+        return format_top([], {}, account_id, None, at=at)
     past_positions = {row["account_id"]: row["position"] for row in db.get_leaderboard_at(_history_cutoffs()["7 дней"])}
     place = db.get_leaderboard_position(account_id) if account_id is not None else None
-    return format_top(leaderboard, past_positions, account_id, place)
+    return format_top(leaderboard, past_positions, account_id, place, at=at)
 
 
 async def _exit_account_input(message: Message, state: FSMContext | None) -> None:
@@ -286,6 +291,13 @@ async def _connect_account(
     if state is not None:
         await state.clear()
     rating = result.rating
+    if rating is None and db.get_final_standings() is not None:
+        await message.answer(
+            f"Dota-профиль подключён.\n\n{_nickname(result.player)}\n\n"
+            "Сезон завершён. Матчи сохраняются без начисления TR.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return
     if result.unchanged:
         status = f"Turbo Rating: {rating['current_rating']:.0f}" if rating else "Рейтинг пока не рассчитан."
         await message.answer(
@@ -328,6 +340,19 @@ async def top_command(message: Message, state: FSMContext | None = None) -> None
     )
 
 
+@router.message(Command("prizes"))
+@router.message(F.text == PRIZES_BUTTON)
+async def prizes_command(message: Message, state: FSMContext | None = None) -> None:
+    await _exit_account_input(message, state)
+    at = season.now()
+    leaderboard = db.get_leaderboard(limit=3)
+    final = db.get_final_standings()
+    await message.answer(
+        format_prizes(final if final is not None else leaderboard, finished=final is not None, at=at),
+        reply_markup=get_main_keyboard(_player(message) is not None),
+    )
+
+
 @router.message(Command("profile"))
 @router.message(F.text == PROFILE_BUTTON)
 async def profile_command(message: Message, state: FSMContext | None = None) -> None:
@@ -340,7 +365,10 @@ async def profile_command(message: Message, state: FSMContext | None = None) -> 
 
 async def _load_rating(message: Message, account_id: int, api_key: str | None):
     try:
-        return await initialize_rating(account_id, api_key=api_key)
+        rating = await initialize_rating(account_id, api_key=api_key)
+        if rating is None:
+            await message.answer("Сезон завершён. Рейтинг в этом сезоне не рассчитан.", reply_markup=MAIN_KEYBOARD)
+        return rating
     except (httpx.HTTPError, sqlite3.Error, ValueError) as exc:
         await message.answer(_service_error(exc, "Не удалось загрузить рейтинг. Попробуйте позже."))
         return None
@@ -426,7 +454,14 @@ async def sync_command(message: Message, api_key: str | None = None, state: FSMC
         if not succeeded:
             _sync_cooldowns.pop(telegram_id, None)
 
-    if not result.rating_updates:
+    if db.get_final_standings() is not None:
+        rating = db.get_rating(player["account_id"])
+        status = f"\n\nTurbo Rating: {rating['current_rating']:.0f}" if rating else ""
+        await message.answer(
+            f"Сезон завершён.\nНовых матчей сохранено: {result.new_count}.\nTR сезона зафиксирован.{status}",
+            reply_markup=MAIN_KEYBOARD,
+        )
+    elif not result.rating_updates:
         rating = db.get_rating(player["account_id"])
         await message.answer(
             f"Данные актуальны.\n\nTurbo Rating: {rating['current_rating']:.0f}",

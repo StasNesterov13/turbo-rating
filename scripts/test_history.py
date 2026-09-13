@@ -25,6 +25,7 @@ from scripts.test_rating import match
 
 class HistoryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         from app import bot as bot_module
         self.module = importlib.reload(bot_module)
         temporary = tempfile.TemporaryDirectory(prefix="turbo-history-test-")

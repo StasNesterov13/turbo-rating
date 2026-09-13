@@ -28,6 +28,7 @@ from scripts.test_rating import match
 
 class AutosyncTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         temporary = tempfile.TemporaryDirectory(prefix="turbo-autosync-test-")
         self.addCleanup(temporary.cleanup)
         self.enterContext(patch.object(db, "DB_PATH", Path(temporary.name) / "test.db"))
@@ -314,7 +315,8 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         db.link_telegram_user(103, 43)
         message.answer.reset_mock()
         await top_command(message)
-        self.assertEqual(message.answer.await_args.args[0], "🥇 Turbo Rating\n\n🥇 Player 43 — 1200  —\n🥈 Test Player — 1000  — ← вы")
+        self.assertEqual(message.answer.await_args.args[0].split("\n\n💰 Призы:")[0],
+                         "🥇 Turbo Rating\n\n🥇 Player 43 — 1200  —\n🥈 Test Player — 1000  — ← вы")
         self.fetch.return_value = [match(2, 1002, False), match(1, 1001)]
         message.answer.reset_mock()
         with patch("app.notifications.notify_rating_updates", new=AsyncMock()) as notify:
@@ -334,6 +336,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
 
 class RestartPaginationTests(unittest.IsolatedAsyncioTestCase):
     async def test_restart_fetches_more_than_20_and_rates_chronologically(self):
+        self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         with tempfile.TemporaryDirectory(prefix="turbo-restart-test-") as directory:
             with patch.object(db, "DB_PATH", Path(directory) / "test.db"):
                 db.init_db()

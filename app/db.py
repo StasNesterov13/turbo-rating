@@ -1,11 +1,14 @@
 """Local SQLite storage for tracked players and their matches."""
 
 from contextlib import contextmanager
+import json
 import os
 from pathlib import Path
 import sqlite3
 import time
 from typing import Any, Callable, Iterator
+
+from app import season
 
 
 DB_PATH = Path(
@@ -79,6 +82,12 @@ def init_db() -> None:
                 PRIMARY KEY (account_id, match_id),
                 FOREIGN KEY (account_id, match_id) REFERENCES matches(account_id, match_id)
             );
+
+            CREATE TABLE IF NOT EXISTS season_final_standings (
+                season_end_at INTEGER PRIMARY KEY,
+                finalized_at INTEGER NOT NULL,
+                standings_json TEXT NOT NULL
+            );
             """
         )
         connection.execute("BEGIN IMMEDIATE")
@@ -87,6 +96,46 @@ def init_db() -> None:
             connection.execute(
                 "ALTER TABLE matches ADD COLUMN is_calibration INTEGER NOT NULL DEFAULT 0"
             )
+        _finalize_season(connection)
+
+
+_LEADERBOARD_QUERY = """
+    SELECT p.account_id, p.nickname, r.current_rating
+    FROM ratings r JOIN players p ON p.account_id = r.account_id
+    WHERE EXISTS (SELECT 1 FROM telegram_users t WHERE t.account_id = p.account_id)
+    ORDER BY r.current_rating DESC, p.account_id ASC
+"""
+
+
+def _finalize_season(connection: sqlite3.Connection) -> list[dict[str, Any]] | None:
+    """Read/fix the complete standings once, under the caller's write lock.
+
+    A single snapshot row also records an empty season. Names, membership, ties
+    and places below top-20 survive account switches, renames and restarts.
+    """
+    end_at = int(season.SEASON_END_AT.timestamp())
+    row = connection.execute(
+        "SELECT standings_json FROM season_final_standings WHERE season_end_at = ?", (end_at,),
+    ).fetchone()
+    if row is not None:
+        return json.loads(row["standings_json"])
+    if not season.is_season_over():
+        return None
+    standings = [dict(row, position=position) for position, row in enumerate(
+        connection.execute(_LEADERBOARD_QUERY).fetchall(), start=1,
+    )]
+    connection.execute(
+        "INSERT INTO season_final_standings VALUES (?, ?, ?)",
+        (end_at, int(season.now().timestamp()), json.dumps(standings, ensure_ascii=False)),
+    )
+    return standings
+
+
+def get_final_standings() -> list[dict[str, Any]] | None:
+    """None while active; a persistent snapshot (possibly empty) once finished."""
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        return _finalize_season(connection)
 
 
 def add_player(
@@ -114,6 +163,8 @@ def get_player(account_id: int) -> dict[str, Any] | None:
 
 def update_player_nickname(account_id: int, nickname: str) -> None:
     with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        _finalize_season(connection)
         connection.execute(
             "UPDATE players SET nickname = ? WHERE account_id = ? AND nickname IS NOT ?",
             (nickname, account_id, nickname),
@@ -196,6 +247,8 @@ def get_player_matches(
 def link_telegram_user(telegram_id: int, account_id: int) -> None:
     """Atomically replace one user's link, preserving all player data."""
     with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        _finalize_season(connection)
         connection.execute(
             """
             INSERT INTO telegram_users (telegram_id, account_id) VALUES (?, ?)
@@ -237,15 +290,19 @@ def get_rating(account_id: int) -> dict[str, Any] | None:
 def create_rating(
     account_id: int, initial_rating: float, calibration_matches: list[dict[str, Any]],
     calibration_wins: int,
-) -> dict[str, Any]:
+) -> dict[str, Any] | None:
     """Atomically store calibration and rating once, including concurrent callers."""
     with _connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        final = _finalize_season(connection)
         existing = connection.execute(
             "SELECT * FROM ratings WHERE account_id = ?", (account_id,)
         ).fetchone()
         if existing is not None:
             return dict(existing)
+        if final is not None:
+            return None
+        connection.execute("SAVEPOINT calibration")
         for match in calibration_matches:
             _save_match(connection, account_id, match, is_calibration=True)
             connection.execute(
@@ -262,6 +319,10 @@ def create_rating(
             (account_id, initial_rating, initial_rating,
              len(calibration_matches), calibration_wins, int(time.time())),
         )
+        if season.is_season_over():
+            connection.execute("ROLLBACK TO calibration")
+            _finalize_season(connection)
+            return None
         return dict(connection.execute(
             "SELECT * FROM ratings WHERE account_id = ?", (account_id,)
         ).fetchone())
@@ -273,6 +334,9 @@ def apply_pending_ratings(
     """Atomically rate eligible matches missing history, oldest first."""
     with _connect() as connection:
         connection.execute("BEGIN IMMEDIATE")
+        if _finalize_season(connection) is not None:
+            return []
+        connection.execute("SAVEPOINT rating_batch")
         rating = connection.execute(
             "SELECT current_rating FROM ratings WHERE account_id = ?", (account_id,)
         ).fetchone()
@@ -318,6 +382,11 @@ def apply_pending_ratings(
                 "UPDATE ratings SET current_rating = ? WHERE account_id = ?",
                 (current, account_id),
             )
+        # A calculation started before the deadline may finish after it.
+        if season.is_season_over():
+            connection.execute("ROLLBACK TO rating_batch")
+            _finalize_season(connection)
+            return []
     return changes
 
 
@@ -350,15 +419,13 @@ def get_leaderboard(limit: int = 20) -> list[dict[str, Any]]:
     if type(limit) is not int or limit <= 0:
         raise ValueError("limit должен быть положительным целым числом.")
     with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        final = _finalize_season(connection)
+        if final is not None:
+            return [{key: row[key] for key in ("account_id", "nickname", "current_rating")}
+                    for row in final[:min(limit, 20)]]
         return [dict(row) for row in connection.execute(
-            """
-            SELECT p.account_id, p.nickname, r.current_rating
-            FROM ratings r JOIN players p ON p.account_id = r.account_id
-            WHERE EXISTS (
-                SELECT 1 FROM telegram_users t WHERE t.account_id = p.account_id
-            )
-            ORDER BY r.current_rating DESC, p.account_id ASC LIMIT ?
-            """,
+            _LEADERBOARD_QUERY + " LIMIT ?",
             (min(limit, 20),),
         ).fetchall()]
 
@@ -401,6 +468,13 @@ def get_turbo_stats(account_id: int) -> dict[str, Any]:
 def get_leaderboard_position(account_id: int, *, rating: float | None = None) -> dict[str, Any] | None:
     """Rank an active player, optionally at another rating without changing it."""
     with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        final = _finalize_season(connection)
+        if final is not None:
+            return next((
+                {key: row[key] for key in ("account_id", "current_rating", "position")}
+                for row in final if row["account_id"] == account_id
+            ), None)
         row = connection.execute(
             """
             WITH subject AS (

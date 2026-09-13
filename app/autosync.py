@@ -15,6 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 async def sync_tracked_players(bot: Bot, *, api_key: str | None = None) -> None:
+    db.get_final_standings()
     for account_id in db.get_tracked_account_ids():
         try:
             result = await sync_player(account_id, api_key=api_key)

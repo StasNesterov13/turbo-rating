@@ -44,7 +44,7 @@ async def link_dota_account(
     profile = await ensure_player(account_id, api_key=api_key)
     player = db.get_player(account_id)
     rating = db.get_rating(account_id)
-    if player is None or rating is None:
+    if player is None or (rating is None and db.get_final_standings() is None):
         raise ValueError("Dota player and rating must be initialized before linking")
     # One SQLite transaction updates the link; no old player data is deleted.
     db.link_telegram_user(telegram_id, account_id)

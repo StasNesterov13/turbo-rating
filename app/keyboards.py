@@ -15,6 +15,7 @@ LINK_BUTTON = "➕ Привязать Dota"
 CHANGE_BUTTON = "🔁 Сменить Dota"
 SHARE_BUTTON = "🔗 Поделиться"
 HISTORY_BUTTON = "📈 История TR"
+PRIZES_BUTTON = "💰 Призы"
 CHANGE_CONFIRM_PREFIX = "dota_change:confirm:"
 CHANGE_CANCEL_PREFIX = "dota_change:cancel:"
 VIEW_TOP_BUTTON = "🥇 Посмотреть топ"
@@ -25,6 +26,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(text=RATING_BUTTON), KeyboardButton(text=TOP_BUTTON)],
         [KeyboardButton(text=HISTORY_BUTTON), KeyboardButton(text=MATCHES_BUTTON)],
         [KeyboardButton(text=SYNC_BUTTON), KeyboardButton(text=PROFILE_BUTTON)],
+        [KeyboardButton(text=PRIZES_BUTTON)],
         [KeyboardButton(text=RATING_HELP_BUTTON)],
     ],
     resize_keyboard=True,
@@ -34,7 +36,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
 UNLINKED_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=LINK_BUTTON)],
-        [KeyboardButton(text=VIEW_TOP_BUTTON)],
+        [KeyboardButton(text=VIEW_TOP_BUTTON), KeyboardButton(text=PRIZES_BUTTON)],
         [KeyboardButton(text=RATING_HELP_BUTTON)],
     ],
     resize_keyboard=True,

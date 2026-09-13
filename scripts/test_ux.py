@@ -21,7 +21,7 @@ if __package__ in (None, ""):
 
 from app import db
 from app.keyboards import (
-    MAIN_KEYBOARD, UNLINKED_KEYBOARD, LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON, SHARE_BUTTON, HISTORY_BUTTON,
+    MAIN_KEYBOARD, UNLINKED_KEYBOARD, LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON, SHARE_BUTTON, HISTORY_BUTTON, PRIZES_BUTTON,
 )
 from app.notifications import format_rating_updates, notify_rating_updates
 from app.services import heroes, sync as sync_service
@@ -108,6 +108,7 @@ class HeroTests(unittest.IsolatedAsyncioTestCase):
 
 class UXTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         from app import bot as bot_module
         temporary = tempfile.TemporaryDirectory(prefix="turbo-ux-test-")
         self.addCleanup(temporary.cleanup)
@@ -355,8 +356,8 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
                 buttons = [button.text for row in MAIN_KEYBOARD.keyboard for button in row]
                 self.assertEqual(buttons, ["🏆 Мой рейтинг", "🥇 Топ", HISTORY_BUTTON,
-                                           "🎮 Матчи", "🔄 Обновить", "👤 Профиль", RATING_HELP_BUTTON])
-                for button, command in zip(buttons, ("/rating", "/top", "/history", "/matches", "/sync", "/profile")):
+                                           "🎮 Матчи", "🔄 Обновить", "👤 Профиль", PRIZES_BUTTON, RATING_HELP_BUTTON])
+                for button, command in zip(buttons, ("/rating", "/top", "/history", "/matches", "/sync", "/profile", "/prizes")):
                     self.assertEqual((await send(button)).text, (await send(command)).text)
                 self.assertEqual(sync.await_count, 2)
                 sync.assert_awaited_with(42, api_key=None)
@@ -390,7 +391,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
                     self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
                 for button in buttons:
-                    if button in ("🥇 Топ", RATING_HELP_BUTTON):
+                    if button in ("🥇 Топ", RATING_HELP_BUTTON, PRIZES_BUTTON):
                         continue
                     response = await send(button, user_id=999)
                     self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
@@ -404,7 +405,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                                  "🏆 Turbo Rating — рейтинг Turbo среди друзей.\nПрисоединяйся: https://t.me/turbo_rating_test_bot")
                 self.assertEqual(shared.reply_markup, MAIN_KEYBOARD)
         self.assertEqual([cmd.command for cmd in bot_module.BOT_COMMANDS],
-                         ["start", "add", "rating", "history", "top", "matches", "sync", "profile"])
+                         ["start", "add", "rating", "history", "top", "prizes", "matches", "sync", "profile"])
 
     async def test_named_notifications_and_length_with_long_names(self):
         win = RatingUpdate(1, 1001, 44, True, 1000, 16, 1016)
@@ -454,6 +455,7 @@ class AccountParsingTests(unittest.TestCase):
 
 class OnboardingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         from app import bot as bot_module
         self.module = importlib.reload(bot_module)
         temporary = tempfile.TemporaryDirectory(prefix="turbo-onboarding-test-")
@@ -503,7 +505,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
             self.assertEqual(
                 [button.text for row in response.reply_markup.keyboard for button in row],
-                [LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON],
+                [LINK_BUTTON, VIEW_TOP_BUTTON, PRIZES_BUTTON, RATING_HELP_BUTTON],
             )
             self.assertEqual((await self.send(VIEW_TOP_BUTTON, user_id)).text,
                              (await self.send("/top", user_id)).text)
