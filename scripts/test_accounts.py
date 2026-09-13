@@ -106,7 +106,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         unlinked = (await self.send("/start", user_id=202))[0]
         self.assertEqual(linked.reply_markup, MAIN_KEYBOARD)
         self.assertEqual(unlinked.reply_markup, UNLINKED_KEYBOARD)
-        self.assertIn(CHANGE_BUTTON, [b.text for row in linked.reply_markup.keyboard for b in row])
+        self.assertNotIn(CHANGE_BUTTON, [b.text for row in linked.reply_markup.keyboard for b in row])
         self.assertNotIn(LINK_BUTTON, [b.text for row in linked.reply_markup.keyboard for b in row])
         confirmation = (await self.send(CHANGE_BUTTON))[0]
         self.assertEqual(confirmation.text,
@@ -321,7 +321,8 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         await self.send("/add 43")
         for command in ("/profile", "/rating", "/stats"):
             response = (await self.send(command))[0].text
-            self.assertIn("Player 43", response)
+            if command == "/profile":
+                self.assertIn("Player 43", response)
             self.assertNotIn("Old Player", response)
             self.assertIn("1070", response)
         top = (await self.send("/top"))[0].text

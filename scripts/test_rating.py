@@ -267,7 +267,8 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIn("+16", rating_text)
                 self.assertIn("Старт: 1000", rating_text)
                 self.assertIn("Рекорд: 1016 TR", rating_text)
-                self.assertIn("📈 История TR", rating_text)
+                self.assertNotIn("Последние", rating_text)
+                self.assertEqual(await command("/stats"), rating_text)
                 await command("/sync")
                 self.assertEqual(await command("/rating"), rating_text)
 

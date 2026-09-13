@@ -29,7 +29,7 @@ from app.keyboards import (
 from app.services.accounts import InvalidDotaAccountError, link_dota_account
 from app.services.heroes import get_hero_name, load_heroes
 from app.services.game_modes import get_game_mode_name
-from app.services.sync import MatchHistoryUnavailable, get_last_sync_time, sync_player
+from app.services.sync import MatchHistoryUnavailable, sync_player
 from app.services.rating import initialize_rating
 
 
@@ -59,19 +59,21 @@ ONBOARDING_MESSAGE = (
     "Чтобы начать, привяжите Dota-профиль."
 )
 RATING_HELP_MESSAGE = (
-    "Как считается Turbo Rating\n\n"
-    "При подключении берём до 20 последних Turbo-игр\n"
-    "и по их результатам определяем стартовый рейтинг.\n\n"
-    "Средняя точка — 1000 TR.\n\n"
-    "После подключения:\n\n"
-    "WIN → рейтинг растёт\n"
-    "LOSE → рейтинг падает\n\n"
-    "Изменение зависит от текущего рейтинга:\n"
-    "чем выше игрок находится, тем больше нужно выигрывать,\n"
-    "чтобы продолжать расти.\n\n"
-    "KDA, убийства, GPM, XPM и другие личные показатели\n"
-    "не влияют на рейтинг.\n\n"
-    "Учитывается только результат команды."
+    "🏆 Как считается Turbo Rating\n\n"
+    "Стартовый рейтинг считается по последним 20 Turbo-матчам.\n\n"
+    "Например:\n"
+    "10W / 10L → ~1000 TR\n"
+    "14W / 6L → ~1095 TR\n"
+    "8W / 12L → ~953 TR\n\n"
+    "Дальше каждая новая Turbo-игра меняет рейтинг.\n\n"
+    "Если у тебя 1000 TR:\n"
+    "WIN → примерно +16\n"
+    "LOSE → примерно -16\n\n"
+    "Если ты уже поднялся до 1200 TR:\n"
+    "WIN → примерно +8\n"
+    "LOSE → примерно -24\n\n"
+    "То есть чем выше твой TR, тем сложнее подниматься дальше и удерживать рейтинг.\n\n"
+    "Учитывается только WIN / LOSE."
 )
 
 
@@ -87,9 +89,8 @@ class ChangeDota(StatesGroup):
 BOT_COMMANDS = [
     BotCommand(command="start", description="Начать работу"),
     BotCommand(command="add", description="Подключить Dota аккаунт"),
-    BotCommand(command="rating", description="Рейтинг и последние игры"),
+    BotCommand(command="rating", description="Мой рейтинг"),
     BotCommand(command="history", description="История TR и движение в топе"),
-    BotCommand(command="stats", description="Статистика Turbo"),
     BotCommand(command="top", description="Таблица лидеров"),
     BotCommand(command="matches", description="Последние матчи"),
     BotCommand(command="sync", description="Обновить матчи"),
@@ -103,18 +104,6 @@ def _player(message: Message):
 
 def _nickname(player: dict) -> str:
     return " ".join((player.get("nickname") or "имя недоступно").split())[:80]
-
-
-def _count_label(count: int, forms: tuple[str, str, str]) -> str:
-    if 11 <= count % 100 <= 14:
-        word = forms[2]
-    elif count % 10 == 1:
-        word = forms[0]
-    elif 2 <= count % 10 <= 4:
-        word = forms[1]
-    else:
-        word = forms[2]
-    return f"{count} {word}"
 
 
 def _position(account_id: int) -> str:
@@ -138,14 +127,9 @@ def _rank_movement(before: int | None, current: int) -> str:
     return f"  ↑{change}" if change > 0 else f"  ↓{-change}" if change < 0 else "  —"
 
 
-def _form_text(account_id: int, *, with_streak: bool = False) -> str:
+def _form_text(account_id: int) -> str:
     form = db.get_turbo_form(account_id)
-    text = "Последние:\n" + (" ".join(form["results"]) or "пока нет игр")
-    if with_streak:
-        forms = ("победа", "победы", "побед") if form["streak_win"] else ("поражение", "поражения", "поражений")
-        streak = _count_label(form["streak"], forms) if form["streak"] else "пока нет"
-        text += f"\n\nСерия: {streak}"
-    return text
+    return "Последние:\n" + (" ".join(form["results"]) or "пока нет игр")
 
 
 def _service_error(exc: Exception, fallback: str) -> str:
@@ -208,13 +192,9 @@ async def start_command(message: Message, state: FSMContext | None = None) -> No
     account_id = player["account_id"]
     rating = db.get_rating(account_id)
     status = f"{rating['current_rating']:.0f} TR · место {_position(account_id)}" if rating else "Рейтинг пока не рассчитан. Нажмите «Мой рейтинг»."
-    stats = db.get_turbo_stats(account_id)
-    updated_at = get_last_sync_time(account_id)
-    updated = datetime.fromtimestamp(updated_at, timezone.utc).strftime("%d.%m %H:%M UTC") if updated_at is not None else "ожидаем обновления"
     await message.answer(
         f"🏆 Turbo Rating\n\n{_nickname(player)}\n{status}\n\n"
-        f"{stats['matches']} Turbo · {stats['winrate']:.1f}% WR\n\n"
-        f"{_form_text(account_id)}\n\nОбновлено: {updated}",
+        f"{_form_text(account_id)}",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -400,13 +380,12 @@ async def profile_command(message: Message, api_key: str | None = None, state: F
     if rating is None:
         return
 
-    stats = db.get_turbo_stats(player["account_id"])
+    connected = datetime.fromtimestamp(player["tracking_started_at"], timezone.utc).strftime("%d.%m.%Y")
     await message.answer(
         f"👤 Профиль\n\n{_nickname(player)}\n\n"
         f"Dota ID: {player['account_id']}\n"
-        f"Turbo Rating: {rating['current_rating']:.0f}\n"
-        f"Место: {_position(player['account_id'])}\n\n"
-        f"Turbo игр: {stats['matches']}\nWinrate: {stats['winrate']:.1f}%",
+        f"Подключён: {connected}\n"
+        f"Turbo Rating: {rating['current_rating']:.0f}",
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -419,8 +398,8 @@ async def _load_rating(message: Message, account_id: int, api_key: str | None):
         return None
 
 
-@router.message(Command("rating"))
-@router.message(F.text.in_({RATING_BUTTON, "🏆 Рейтинг"}))
+@router.message(Command("rating", "stats"))
+@router.message(F.text.in_({RATING_BUTTON, "🏆 Рейтинг", STATS_BUTTON}))
 async def rating_command(message: Message, api_key: str | None = None, state: FSMContext | None = None) -> None:
     player = await _linked_player(message, state)
     if player is None:
@@ -428,25 +407,14 @@ async def rating_command(message: Message, api_key: str | None = None, state: FS
     rating = await _load_rating(message, player["account_id"], api_key)
     if rating is None:
         return
-    stats = db.get_turbo_stats(player["account_id"])
     text = (
-        f"🏆 Мой рейтинг\n\n{_nickname(player)}\n\n"
+        "🏆 Мой рейтинг\n\n"
         f"{rating['current_rating']:.0f} TR\n"
+        f"Место: {_position(player['account_id'])}\n"
+        f"Старт: {rating['initial_rating']:.0f} TR\n"
         f"Рекорд: {db.get_peak_rating(player['account_id']):.0f} TR\n"
-        f"7 дней: {db.get_rating_change(player['account_id'], _history_cutoffs()['7 дней']):+.0f} TR\n"
-        f"Место: {_position(player['account_id'])}\n\n"
-        f"Старт: {rating['initial_rating']:.0f}\n"
-        f"Изменение: {rating['current_rating'] - rating['initial_rating']:+.0f}\n\n"
-        "Turbo после регистрации:\n"
-        f"{_count_label(stats['matches'], ('игра', 'игры', 'игр'))} · "
-        f"{_count_label(stats['wins'], ('победа', 'победы', 'побед'))} · "
-        f"{_count_label(stats['losses'], ('поражение', 'поражения', 'поражений'))}\n"
-        f"Winrate: {stats['winrate']:.1f}%"
+        f"7 дней: {db.get_rating_change(player['account_id'], _history_cutoffs()['7 дней']):+.0f} TR"
     )
-    if stats["unknown"]:
-        text += f"\nБез результата: {stats['unknown']}"
-    text += f"\n\n{_form_text(player['account_id'], with_streak=True)}"
-    text += "\n\nПодробная история — «📈 История TR»."
     await message.answer(text, reply_markup=MAIN_KEYBOARD)
 
 
@@ -462,13 +430,9 @@ async def history_command(message: Message, api_key: str | None = None, state: F
         return
     cutoffs = _history_cutoffs()
     current_place = _position(account_id)
-    lines = [
-        "📈 История TR", "", _nickname(player), "",
-        f"Сейчас: {rating['current_rating']:.0f} TR",
-        f"Рекорд: {db.get_peak_rating(account_id):.0f} TR", "",
-    ]
+    lines = ["📈 История TR", ""]
     lines.extend(f"{label}: {db.get_rating_change(account_id, since):+.0f} TR" for label, since in cutoffs.items())
-    lines.extend(["", f"Место сейчас: {current_place}"])
+    lines.append("")
     for label in ("7 дней", "30 дней"):
         previous = db.get_rank_at(account_id, cutoffs[label])
         movement = f"#{previous} → {current_place}" if previous is not None else "ещё не зарегистрирован"
@@ -481,30 +445,6 @@ async def history_command(message: Message, api_key: str | None = None, state: F
     if not history:
         lines.append("Начислений пока нет.")
     await message.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD)
-
-
-@router.message(Command("stats"))
-@router.message(F.text == STATS_BUTTON)
-async def stats_command(message: Message, api_key: str | None = None, state: FSMContext | None = None) -> None:
-    player = await _linked_player(message, state)
-    if player is None:
-        return
-    rating = await _load_rating(message, player["account_id"], api_key)
-    if rating is None:
-        return
-    stats = db.get_turbo_stats(player["account_id"])
-    text = (
-        f"📊 Статистика\n\n{_nickname(player)}\n\n"
-        f"Turbo Rating: {rating['current_rating']:.0f}\n"
-        f"Стартовый рейтинг: {rating['initial_rating']:.0f}\n\n"
-        f"Turbo матчей: {stats['matches']}\n"
-        f"Победы: {stats['wins']}\nПоражения: {stats['losses']}\n"
-        f"Winrate: {stats['winrate']:.1f}%"
-    )
-    if stats["unknown"]:
-        text += f"\nБез результата: {stats['unknown']}"
-    text += f"\n\nИзменение рейтинга:\n{rating['current_rating'] - rating['initial_rating']:+.0f} TR"
-    await message.answer(text, reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(Command("matches"))

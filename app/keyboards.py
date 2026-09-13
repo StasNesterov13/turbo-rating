@@ -23,11 +23,8 @@ RATING_HELP_BUTTON = "ℹ️ Как считается рейтинг"
 MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=RATING_BUTTON), KeyboardButton(text=TOP_BUTTON)],
-        [KeyboardButton(text=STATS_BUTTON), KeyboardButton(text=MATCHES_BUTTON)],
+        [KeyboardButton(text=HISTORY_BUTTON), KeyboardButton(text=MATCHES_BUTTON)],
         [KeyboardButton(text=SYNC_BUTTON), KeyboardButton(text=PROFILE_BUTTON)],
-        [KeyboardButton(text=HISTORY_BUTTON)],
-        [KeyboardButton(text=CHANGE_BUTTON), KeyboardButton(text=SHARE_BUTTON)],
-        [KeyboardButton(text=RATING_HELP_BUTTON)],
     ],
     resize_keyboard=True,
     is_persistent=True,

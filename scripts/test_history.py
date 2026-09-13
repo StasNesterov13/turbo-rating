@@ -164,16 +164,15 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.text, (await self.send(HISTORY_BUTTON)).text)
         self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
         self.assertEqual(response.text,
-                         "📈 История TR\n\nДЕРЕВЕНСКИЙ\n\nСейчас: 1124 TR\nРекорд: 1187 TR\n\n"
+                         "📈 История TR\n\n"
                          "Сегодня: +18 TR\n7 дней: +84 TR\n30 дней: +137 TR\n\n"
-                         "Место сейчас: #3\n7 дней назад: #6 → #3\n30 дней назад: #9 → #3\n\n"
+                         "7 дней назад: #6 → #3\n30 дней назад: #9 → #3\n\n"
                          "Последние изменения:\n\n13.09  +17   1124 TR\n13.09  +1   1107 TR\n"
                          "12.09  +12   1106 TR\n11.09  +14   1094 TR\n07.09  +40   1080 TR\n"
                          "03.09  -147   1040 TR\n19.08  +200   1187 TR")
         rating = (await self.send("/rating")).text
-        self.assertIn("Рекорд: 1187 TR\n7 дней: +84 TR\nМесто: #3", rating)
-        self.assertNotIn("Последние изменения:", rating)
-        self.assertIn(HISTORY_BUTTON, rating)
+        self.assertEqual(rating, "🏆 Мой рейтинг\n\n1124 TR\nМесто: #3\nСтарт: 987 TR\n"
+                                 "Рекорд: 1187 TR\n7 дней: +84 TR")
         self.assertEqual(self.snapshot(), before)
 
     async def test_history_limit_empty_and_unlinked_users(self):
@@ -182,7 +181,8 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
         self.player(42, 1187, registered=self.timestamp - self.day)
         empty = (await self.send(HISTORY_BUTTON)).text
-        self.assertIn("Сейчас: 1187 TR\nРекорд: 1187 TR", empty)
+        self.assertNotIn("Сейчас:", empty)
+        self.assertNotIn("Рекорд:", empty)
         self.assertIn("Сегодня: +0 TR\n7 дней: +0 TR\n30 дней: +0 TR", empty)
         self.assertIn("7 дней назад: ещё не зарегистрирован", empty)
         self.assertIn("30 дней назад: ещё не зарегистрирован", empty)
