@@ -82,8 +82,6 @@ def format_top(
     if own_place and own_place["position"] > len(leaderboard):
         movement = _rank_movement(past_positions.get(account_id), own_place["position"])
         lines.extend(["", f"Ваше место: #{own_place['position']} — {own_place['current_rating']:.0f} TR{movement}"])
-    lines.extend(["", "💰 Призы: " + " / ".join(f"{amount} ₽" for amount in PRIZES.values()),
-                  f"До конца сезона: {format_countdown(at)}"])
     return "\n".join(lines)
 
 
