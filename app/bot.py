@@ -27,10 +27,13 @@ from app.keyboards import (
     SHARE_BUTTON, HISTORY_BUTTON,
 )
 from app.services.accounts import InvalidDotaAccountError, link_dota_account
-from app.services.heroes import get_hero_name, load_heroes
-from app.services.game_modes import get_game_mode_name
+from app.services.heroes import load_heroes
 from app.services.sync import MatchHistoryUnavailable, sync_player
 from app.services.rating import initialize_rating
+from app.screens import (
+    format_home, format_rating, format_history, format_top, format_matches,
+    format_profile, format_nickname as _nickname,
+)
 
 
 router = Router()
@@ -48,14 +51,6 @@ INVALID_ACCOUNT_MESSAGE = "Не удалось определить Dota акк�
 ONBOARDING_MESSAGE = (
     "🏆 Turbo Rating\n\n"
     "Рейтинг Turbo-игр среди друзей.\n\n"
-    "Как это работает:\n"
-    "• стартовый рейтинг рассчитывается по последним 20 Turbo-матчам;\n"
-    "• после подключения каждая новая Turbo-игра меняет рейтинг;\n"
-    "• победа повышает рейтинг, поражение снижает;\n"
-    "• чем выше рейтинг, тем сложнее его удерживать;\n"
-    "• учитываются только матчи Turbo.\n\n"
-    "Здесь можно смотреть своё место, статистику,\n"
-    "последние матчи и общий топ.\n\n"
     "Чтобы начать, привяжите Dota-профиль."
 )
 RATING_HELP_MESSAGE = (
@@ -102,10 +97,6 @@ def _player(message: Message):
     return db.get_telegram_player(message.from_user.id) if message.from_user else None
 
 
-def _nickname(player: dict) -> str:
-    return " ".join((player.get("nickname") or "имя недоступно").split())[:80]
-
-
 def _position(account_id: int) -> str:
     place = db.get_leaderboard_position(account_id)
     return f"#{place['position']}" if place else "пока нет"
@@ -118,18 +109,6 @@ def _history_cutoffs() -> dict[str, int]:
         "7 дней": int((now - timedelta(days=7)).timestamp()),
         "30 дней": int((now - timedelta(days=30)).timestamp()),
     }
-
-
-def _rank_movement(before: int | None, current: int) -> str:
-    if before is None:
-        return ""
-    change = before - current
-    return f"  ↑{change}" if change > 0 else f"  ↓{-change}" if change < 0 else "  —"
-
-
-def _form_text(account_id: int) -> str:
-    form = db.get_turbo_form(account_id)
-    return "Последние:\n" + (" ".join(form["results"]) or "пока нет игр")
 
 
 def _service_error(exc: Exception, fallback: str) -> str:
@@ -145,22 +124,10 @@ def _service_error(exc: Exception, fallback: str) -> str:
 def _leaderboard(account_id: int | None) -> str:
     leaderboard = db.get_leaderboard()
     if not leaderboard:
-        return "Рейтинг игроков пока пуст."
-    lines = []
+        return format_top([], {}, account_id, None)
     past_positions = {row["account_id"]: row["position"] for row in db.get_leaderboard_at(_history_cutoffs()["7 дней"])}
-    medals = {1: "🥇", 2: "🥈", 3: "🥉"}
-    for position, player in enumerate(leaderboard, start=1):
-        suffix = " ← вы" if player["account_id"] == account_id else ""
-        movement = _rank_movement(past_positions.get(player["account_id"]), position)
-        lines.append(
-            f"{medals.get(position, f'{position}.')} {_nickname(player)} — "
-            f"{player['current_rating']:.0f}{movement}{suffix}"
-        )
     place = db.get_leaderboard_position(account_id) if account_id is not None else None
-    if place and place["position"] > len(leaderboard):
-        movement = _rank_movement(past_positions.get(account_id), place["position"])
-        lines.extend(["", f"Ваше место: #{place['position']} — {place['current_rating']:.0f} TR{movement}"])
-    return "\n".join(lines)
+    return format_top(leaderboard, past_positions, account_id, place)
 
 
 async def _exit_account_input(message: Message, state: FSMContext | None) -> None:
@@ -191,10 +158,8 @@ async def start_command(message: Message, state: FSMContext | None = None) -> No
         return
     account_id = player["account_id"]
     rating = db.get_rating(account_id)
-    status = f"{rating['current_rating']:.0f} TR · место {_position(account_id)}" if rating else "Рейтинг пока не рассчитан. Нажмите «Мой рейтинг»."
     await message.answer(
-        f"🏆 Turbo Rating\n\n{_nickname(player)}\n{status}\n\n"
-        f"{_form_text(account_id)}",
+        format_home(player, rating, _position(account_id) if rating else "пока нет"),
         reply_markup=MAIN_KEYBOARD,
     )
 
@@ -359,35 +324,24 @@ async def _connect_account(
 
 
 @router.message(Command("top"))
-@router.message(F.text.in_({TOP_BUTTON, VIEW_TOP_BUTTON, "🥇 Топ"}))
+@router.message(F.text.in_({TOP_BUTTON, VIEW_TOP_BUTTON, "🥇 Топ игроков"}))
 async def top_command(message: Message, state: FSMContext | None = None) -> None:
     await _exit_account_input(message, state)
     player = _player(message)
     await message.answer(
-        f"🥇 Turbo Rating\n\n{_leaderboard(player['account_id'] if player else None)}",
+        _leaderboard(player['account_id'] if player else None),
         reply_markup=get_main_keyboard(player is not None),
     )
 
 
 @router.message(Command("profile"))
 @router.message(F.text == PROFILE_BUTTON)
-async def profile_command(message: Message, api_key: str | None = None, state: FSMContext | None = None) -> None:
+async def profile_command(message: Message, state: FSMContext | None = None) -> None:
     player = await _linked_player(message, state)
     if player is None:
         return
 
-    rating = await _load_rating(message, player["account_id"], api_key)
-    if rating is None:
-        return
-
-    connected = datetime.fromtimestamp(player["tracking_started_at"], timezone.utc).strftime("%d.%m.%Y")
-    await message.answer(
-        f"👤 Профиль\n\n{_nickname(player)}\n\n"
-        f"Dota ID: {player['account_id']}\n"
-        f"Подключён: {connected}\n"
-        f"Turbo Rating: {rating['current_rating']:.0f}",
-        reply_markup=MAIN_KEYBOARD,
-    )
+    await message.answer(format_profile(player), reply_markup=MAIN_KEYBOARD)
 
 
 async def _load_rating(message: Message, account_id: int, api_key: str | None):
@@ -407,13 +361,8 @@ async def rating_command(message: Message, api_key: str | None = None, state: FS
     rating = await _load_rating(message, player["account_id"], api_key)
     if rating is None:
         return
-    text = (
-        "🏆 Мой рейтинг\n\n"
-        f"{rating['current_rating']:.0f} TR\n"
-        f"Место: {_position(player['account_id'])}\n"
-        f"Старт: {rating['initial_rating']:.0f} TR\n"
-        f"Рекорд: {db.get_peak_rating(player['account_id']):.0f} TR\n"
-        f"7 дней: {db.get_rating_change(player['account_id'], _history_cutoffs()['7 дней']):+.0f} TR"
+    text = format_rating(
+        rating, _position(player['account_id']), db.get_peak_rating(player['account_id']),
     )
     await message.answer(text, reply_markup=MAIN_KEYBOARD)
 
@@ -430,21 +379,12 @@ async def history_command(message: Message, api_key: str | None = None, state: F
         return
     cutoffs = _history_cutoffs()
     current_place = _position(account_id)
-    lines = ["📈 История TR", ""]
-    lines.extend(f"{label}: {db.get_rating_change(account_id, since):+.0f} TR" for label, since in cutoffs.items())
-    lines.append("")
-    for label in ("7 дней", "30 дней"):
-        previous = db.get_rank_at(account_id, cutoffs[label])
-        movement = f"#{previous} → {current_place}" if previous is not None else "ещё не зарегистрирован"
-        lines.append(f"{label} назад: {movement}")
-    lines.extend(["", "Последние изменения:", ""])
+    changes = {label: db.get_rating_change(account_id, since) for label, since in cutoffs.items()}
+    past_positions = {label: db.get_rank_at(account_id, cutoffs[label]) for label in ("7 дней", "30 дней")}
     history = db.get_rating_history(account_id, limit=10, by_recorded_time=True)
-    for event in history:
-        date = datetime.fromtimestamp(event["created_at"], timezone.utc).strftime("%d.%m")
-        lines.append(f"{date}  {event['rating_delta']:+.0f}   {event['rating_after']:.0f} TR")
-    if not history:
-        lines.append("Начислений пока нет.")
-    await message.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD)
+    await message.answer(
+        format_history(changes, past_positions, current_place, history), reply_markup=MAIN_KEYBOARD,
+    )
 
 
 @router.message(Command("matches"))
@@ -455,17 +395,7 @@ async def matches_command(message: Message, state: FSMContext | None = None) -> 
         return
 
     matches = db.get_player_matches(player["account_id"], limit=5)
-    if not matches:
-        await message.answer("Матчей пока нет. Нажмите «Обновить» после игры.", reply_markup=MAIN_KEYBOARD)
-        return
-
-    lines = ["🎮 Последние матчи"]
-    for match in matches:
-        result = {1: "WIN", 0: "LOSE", None: "Результат пока неизвестен"}[match["win"]]
-        mode = get_game_mode_name(match["game_mode"])
-        duration = f"{match['duration'] / 60:.0f} мин" if match["duration"] is not None else "? мин"
-        lines.append(f"{result}\n{get_hero_name(match['hero_id'])} · {mode} · {duration}")
-    await message.answer("\n\n".join(lines), reply_markup=MAIN_KEYBOARD)
+    await message.answer(format_matches(matches), reply_markup=MAIN_KEYBOARD)
 
 
 @router.message(Command("sync"))

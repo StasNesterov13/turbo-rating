@@ -172,7 +172,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
                          "03.09  -147   1040 TR\n19.08  +200   1187 TR")
         rating = (await self.send("/rating")).text
         self.assertEqual(rating, "🏆 Мой рейтинг\n\n1124 TR\nМесто: #3\nСтарт: 987 TR\n"
-                                 "Рекорд: 1187 TR\n7 дней: +84 TR")
+                                 "Рекорд: 1187 TR")
         self.assertEqual(self.snapshot(), before)
 
     async def test_history_limit_empty_and_unlinked_users(self):

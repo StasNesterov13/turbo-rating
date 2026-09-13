@@ -323,8 +323,11 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
             response = (await self.send(command))[0].text
             if command == "/profile":
                 self.assertIn("Player 43", response)
+                self.assertIn("Dota ID: 43", response)
+                self.assertNotIn("1070", response)
+            else:
+                self.assertIn("1070", response)
             self.assertNotIn("Old Player", response)
-            self.assertIn("1070", response)
         top = (await self.send("/top"))[0].text
         self.assertEqual(top, "🥇 Turbo Rating\n\n🥇 Player 43 — 1070 ← вы")
         self.assertIsNone(db.get_leaderboard_position(42))

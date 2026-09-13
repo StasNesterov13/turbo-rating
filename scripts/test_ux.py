@@ -138,30 +138,29 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
         await start_command(message)
         text = message.answer.await_args.args[0]
-        self.assertEqual(text,
-                         "🏆 Turbo Rating\n\nTest Player\n1000 TR · место #1\n\n"
-                         "Последние:\nW W W L W")
+        self.assertEqual(text, "🏆 Turbo Rating\n\nTest Player\n1000 TR · место #1")
         self.assertEqual(message.answer.await_args.kwargs["reply_markup"], MAIN_KEYBOARD)
         await rating_command(message)
         text = message.answer.await_args.args[0]
         self.assertEqual(text, "🏆 Мой рейтинг\n\n1000 TR\nМесто: #1\nСтарт: 1000 TR\n"
-                               "Рекорд: 1000 TR\n7 дней: +0 TR")
+                               "Рекорд: 1000 TR")
         self.assertEqual((db.get_rating(42), db.get_rating_history(42)), before)
 
-    async def test_home_shows_only_last_five_results_including_empty_form(self):
+    async def test_home_excludes_matches_with_empty_or_populated_history(self):
         from app.bot import start_command
         message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
         await start_command(message)
-        self.assertTrue(message.answer.await_args.args[0].endswith("Последние:\nпока нет игр"))
+        expected = "🏆 Turbo Rating\n\nTest Player\n1000 TR · место #1"
+        self.assertEqual(message.answer.await_args.args[0], expected)
         for index in range(1, 8):
             db.save_match(42, match(index, 1000 + index))
         await start_command(message)
-        self.assertTrue(message.answer.await_args.args[0].endswith("Последние:\nW W W W W"))
+        self.assertEqual(message.answer.await_args.args[0], expected)
         # Equal start times are resolved by match_id, just like rating history.
         for index in (8, 9):
             db.save_match(42, match(index, 1007, False))
         await start_command(message)
-        self.assertTrue(message.answer.await_args.args[0].endswith("Последние:\nL L W W W"))
+        self.assertEqual(message.answer.await_args.args[0], expected)
 
     async def test_manual_cooldown_is_per_telegram_user_across_chats(self):
         from app import bot as bot_module
@@ -296,7 +295,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
             await rating_command(message)
         text = message.answer.await_args.args[0]
         self.assertIn("Рекорд:", text)
-        self.assertIn("7 дней:", text)
+        self.assertNotIn("7 дней:", text)
         self.assertIn("Старт: 1000 TR", text)
         self.assertIn("Место: #1", text)
         self.assertNotIn(HISTORY_BUTTON, text)
@@ -355,8 +354,8 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     response = await send(command)
                     self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
                 buttons = [button.text for row in MAIN_KEYBOARD.keyboard for button in row]
-                self.assertEqual(buttons, ["🏆 Мой рейтинг", "🥇 Топ игроков", HISTORY_BUTTON,
-                                           "🎮 Матчи", "🔄 Обновить", "👤 Профиль"])
+                self.assertEqual(buttons, ["🏆 Мой рейтинг", "🥇 Топ", HISTORY_BUTTON,
+                                           "🎮 Матчи", "🔄 Обновить", "👤 Профиль", RATING_HELP_BUTTON])
                 for button, command in zip(buttons, ("/rating", "/top", "/history", "/matches", "/sync", "/profile")):
                     self.assertEqual((await send(button)).text, (await send(command)).text)
                 self.assertEqual(sync.await_count, 2)
@@ -367,23 +366,23 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     self.assertIn(value, text)
                 self.assertNotIn("hero_id", text)
                 profile = (await send("/profile")).text
-                current = db.get_rating(42)["current_rating"]
                 self.assertEqual(profile, "👤 Профиль\n\nTest Player\n\nDota ID: 42\n"
-                                          f"Подключён: 01.01.1970\nTurbo Rating: {current:.0f}")
+                                          "Подключён: 01.01.1970")
                 rating = (await send("/rating")).text
                 for alias in ("/stats", "📊 Статистика"):
                     self.assertEqual((await send(alias)).text, rating)
                 # Each screen keeps only its own details, including with populated history.
                 for command, forbidden in {
-                    "/start": ("Старт:", "Рекорд:", "7 дней", "Dota ID:", "Обновлено:"),
-                    "/rating": ("Последние", "Сегодня:", "30 дней", "Dota ID:", "Test Player"),
+                    "/start": ("Старт:", "Рекорд:", "7 дней", "30 дней", "Dota ID:", "Обновлено:", "Последние", "WIN", "LOSE"),
+                    "/rating": ("Последние", "Сегодня:", "7 дней", "30 дней", "Dota ID:", "Test Player"),
                     "/history": ("Старт:", "Рекорд:", "Сейчас:", "Dota ID:", "Test Player"),
                     "/top": ("Старт:", "Рекорд:", "Последние", "Сегодня:", "Dota ID:"),
                     "/matches": ("TR", "Rating", "Место:", "Старт:", "Рекорд:", "7 дней"),
-                    "/profile": ("Место:", "Старт:", "Рекорд:", "Последние", "Сегодня:", "7 дней", "30 дней"),
+                    "/profile": ("TR", "Rating", "Место:", "Старт:", "Рекорд:", "Последние", "Сегодня:", "7 дней", "30 дней"),
                 }.items():
                     screen = (await send(command)).text
-                    for label in (*forbidden, "Winrate", "WR", "Turbo игр:", "Победы:", "Поражения:", "Серия:"):
+                    for label in (*forbidden, "Winrate", "WR", "Turbo игр:", "Победы:", "Поражения:", "Серия:",
+                                  "Как это работает:", "Как считается Turbo Rating", "Чтобы начать", "10W / 10L"):
                         with self.subTest(command=command, label=label):
                             self.assertNotIn(label, screen)
                 for command in ("/rating", "/stats", "/history", "/matches", "/sync", "/profile"):
@@ -391,13 +390,14 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
                     self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
                 for button in buttons:
-                    if button == "🥇 Топ игроков":
+                    if button in ("🥇 Топ", RATING_HELP_BUTTON):
                         continue
                     response = await send(button, user_id=999)
                     self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
                     self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
                 self.assertEqual((await send("🏆 Рейтинг")).text, (await send("/rating")).text)
                 self.assertEqual((await send("🥇 Топ")).text, (await send("/top")).text)
+                self.assertEqual((await send("🥇 Топ игроков")).text, (await send("/top")).text)
                 self.assertEqual((await send(HISTORY_BUTTON)).text, (await send("/history")).text)
                 shared = await send(SHARE_BUTTON)
                 self.assertEqual(shared.text,
@@ -495,7 +495,8 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         for user_id, value in enumerate(("165682118", "https://www.opendota.com/players/165682118",
                                          "https://www.dotabuff.com/players/165682118"), 201):
             response = await self.send("/start", user_id)
-            self.assertIn("Как это работает:", response.text)
+            self.assertEqual(response.text, "🏆 Turbo Rating\n\nРейтинг Turbo-игр среди друзей.\n\n"
+                                            "Чтобы начать, привяжите Dota-профиль.")
             self.assertIn("Чтобы начать, привяжите Dota-профиль.", response.text)
             self.assertNotIn("Leader", response.text)
             self.assertNotIn("/add", response.text)
@@ -525,7 +526,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(snapshot, original)
             repeat = await self.send("/start", user_id)
             self.assertIn("ДЕРЕВЕНСКИЙ\n953 TR · место #2", repeat.text)
-            self.assertTrue(repeat.text.endswith("Последние:\nпока нет игр"))
+            self.assertEqual(repeat.text, "🏆 Turbo Rating\n\nДЕРЕВЕНСКИЙ\n953 TR · место #2")
             self.assertNotIn("Leader", repeat.text)
             self.assertNotIn("Как это работает:", repeat.text)
             self.assertNotIn("Привяжите", repeat.text)
@@ -552,7 +553,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         start = await self.send("/start")
         self.assertIn("1200 TR · место #1", start.text)
         self.assertNotIn("Как это работает:", start.text)
-        self.assertNotIn(RATING_HELP_BUTTON, [b.text for row in start.reply_markup.keyboard for b in row])
+        self.assertIn(RATING_HELP_BUTTON, [b.text for row in start.reply_markup.keyboard for b in row])
         self.profile.assert_not_awaited()
         self.history.assert_not_awaited()
 
@@ -615,7 +616,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
             current = db.get_rating(165682118)["current_rating"]
             self.assertIn(f"{current:.0f} TR", rating)
             self.assertNotIn("Последние:", rating)
-            self.assertTrue((await self.send("/start")).text.endswith("Последние:\nL W"))
+            self.assertNotIn("Последние:", (await self.send("/start")).text)
             response = await self.send("🔄 Обновить")
             current = db.get_rating(165682118)["current_rating"]
             self.assertEqual(response.text, f"Данные актуальны.\n\nTurbo Rating: {current:.0f}")

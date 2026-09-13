@@ -7,7 +7,7 @@ from aiogram.types import (
 
 RATING_BUTTON = "🏆 Мой рейтинг"
 STATS_BUTTON = "📊 Статистика"
-TOP_BUTTON = "🥇 Топ игроков"
+TOP_BUTTON = "🥇 Топ"
 MATCHES_BUTTON = "🎮 Матчи"
 SYNC_BUTTON = "🔄 Обновить"
 PROFILE_BUTTON = "👤 Профиль"
@@ -25,6 +25,7 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
         [KeyboardButton(text=RATING_BUTTON), KeyboardButton(text=TOP_BUTTON)],
         [KeyboardButton(text=HISTORY_BUTTON), KeyboardButton(text=MATCHES_BUTTON)],
         [KeyboardButton(text=SYNC_BUTTON), KeyboardButton(text=PROFILE_BUTTON)],
+        [KeyboardButton(text=RATING_HELP_BUTTON)],
     ],
     resize_keyboard=True,
     is_persistent=True,
