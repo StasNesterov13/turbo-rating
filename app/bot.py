@@ -19,6 +19,7 @@ import httpx
 
 from app import db, season
 from app.autosync import run_autosync
+from app.notifications import format_rating_breakdown
 from app.keyboards import (
     MAIN_KEYBOARD, UNLINKED_KEYBOARD, get_main_keyboard, RATING_BUTTON,
     STATS_BUTTON, TOP_BUTTON, MATCHES_BUTTON, SYNC_BUTTON, PROFILE_BUTTON, LINK_BUTTON,
@@ -85,10 +86,16 @@ ONBOARDING_MESSAGE = (
 RATING_HELP_MESSAGE = (
     "Turbo Rating\n\n"
     "Стартовый TR рассчитывается по последним 20 Turbo-матчам.\n\n"
-    "После подключения:\n\n"
+    "За результат матча:\n\n"
     "WIN → +25 TR\n"
     "LOSE → -25 TR\n\n"
-    "На рейтинг влияет только результат Turbo-матча."
+    "За хорошую игру можно получить ещё до +10 TR.\n"
+    "Учитываются участие в убийствах, урон героям и строениям, "
+    "смерти и командный вклад.\n\n"
+    "Пример хорошей игры:\n"
+    "WIN: +25 за победу +5 за performance = +30 TR\n"
+    "LOSE: -25 за поражение +5 за performance = -20 TR\n\n"
+    "Победа или поражение всегда остаются главным фактором рейтинга."
 )
 
 
@@ -526,10 +533,16 @@ async def sync_command(message: Message, api_key: str | None = None, state: FSMC
     else:
         updates = result.rating_updates
         lines = [f"Обновлено.\n\nНовых Turbo: {len(updates)}", ""]
-        lines.extend(f"{'WIN' if u.win else 'LOSE'}  {u.rating_delta:+.0f}" for u in updates[:50])
+        for update in updates[:50]:
+            line = f"{'WIN' if update.win else 'LOSE'}  {update.rating_delta:+.0f} TR"
+            if update.performance_bonus > 0:
+                line += f" · performance +{update.performance_bonus}"
+            lines.append(line)
         if len(updates) > 50:
             lines.append(f"… ещё матчей: {len(updates) - 50}")
         lines.extend(["", f"Rating:\n{updates[0].rating_before:.0f} → {updates[-1].rating_after:.0f}"])
+        if len(updates) == 1:
+            lines.extend(["", format_rating_breakdown(updates[0])])
         await message.answer("\n".join(lines), reply_markup=MAIN_KEYBOARD)
 
 

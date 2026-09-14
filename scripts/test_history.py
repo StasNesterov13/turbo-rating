@@ -264,7 +264,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(text.split("Место:\n")[1], "#5 → #3")
         await notify_rating_updates(bot, 42, [RatingUpdate(3, self.timestamp, 44, True, 1107, 17, 1124)])
         self.assertEqual(bot.send_message.await_args.args[1],
-                         "🟢 Победа в Turbo\n\n+17 TR\n1107 → 1124\n\nМесто:\n#5 → #3")
+                         "🟢 Победа в Turbo\n\n+17 TR\n1107 → 1124\n\nБаза: +17\n\nМесто:\n#5 → #3")
         await notify_rating_updates(bot, 42, [RatingUpdate(4, self.timestamp, 44, False, 1124, -1, 1123)])
         self.assertTrue(bot.send_message.await_args.args[1].endswith("Место: #3"))
         self.assertEqual(self.snapshot(), before)

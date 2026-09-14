@@ -63,6 +63,7 @@ class SeasonTests(unittest.IsolatedAsyncioTestCase):
         )))
         self.history = self.enterContext(patch.object(OpenDotaClient, "get_turbo_matches_before", new=AsyncMock(return_value=[])))
         self.fetch = self.enterContext(patch.object(OpenDotaClient, "get_matches_for_sync", new=AsyncMock(return_value=[])))
+        self.enterContext(patch.object(OpenDotaClient, "get_match", new=AsyncMock(return_value={})))
         self.enterContext(patch.object(httpx.AsyncClient, "send", side_effect=AssertionError("Unexpected HTTP")))
         self.dispatcher = Dispatcher()
         self.dispatcher.include_router(self.module.router)
@@ -174,12 +175,12 @@ class SeasonTests(unittest.IsolatedAsyncioTestCase):
             db.save_match(1, match(match_id, self.end - 100 + match_id))
         calls = 0
 
-        def calculate(current, win):
+        def calculate(current, win, bonus):
             nonlocal calls
             calls += 1
             if calls == 2:
                 self.close_season()
-            return calculate_new_rating(current, win)
+            return calculate_new_rating(current, win, bonus)
 
         self.assertEqual(db.apply_pending_ratings(1, calculate), [])
         self.assertEqual(db.get_rating(1)["current_rating"], 1000)

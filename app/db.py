@@ -96,6 +96,14 @@ def init_db() -> None:
             connection.execute(
                 "ALTER TABLE matches ADD COLUMN is_calibration INTEGER NOT NULL DEFAULT 0"
             )
+        history_columns = {row["name"] for row in connection.execute("PRAGMA table_info(rating_history)")}
+        for name, definition in (
+            ("performance_score", "REAL NULL"),
+            ("performance_bonus", "INTEGER NOT NULL DEFAULT 0"),
+            ("performance_details", "TEXT NULL"),
+        ):
+            if name not in history_columns:
+                connection.execute(f"ALTER TABLE rating_history ADD COLUMN {name} {definition}")
         _finalize_season(connection)
 
 
@@ -328,8 +336,28 @@ def create_rating(
         ).fetchone())
 
 
+_PENDING_RATINGS_QUERY = """
+    SELECT m.* FROM matches m
+    JOIN players p ON p.account_id = m.account_id
+    WHERE m.account_id = ? AND m.game_mode = 23 AND m.is_calibration = 0
+        AND m.start_time >= p.tracking_started_at AND m.win IN (0, 1)
+        AND NOT EXISTS (
+            SELECT 1 FROM rating_history h
+            WHERE h.account_id = m.account_id AND h.match_id = m.match_id
+        )
+    ORDER BY m.start_time ASC, m.match_id ASC
+"""
+
+
+def get_pending_rating_matches(account_id: int) -> list[dict[str, Any]]:
+    """Read candidates before fetching performance; the write transaction rechecks them."""
+    with _connect() as connection:
+        return [dict(row) for row in connection.execute(_PENDING_RATINGS_QUERY, (account_id,))]
+
+
 def apply_pending_ratings(
-    account_id: int, calculate: Callable[[float, bool], tuple[float, float, float]]
+    account_id: int, calculate: Callable[[float, bool, int], tuple[float, float, float]],
+    *, performance_by_match: dict[int, dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     """Atomically rate eligible matches missing history, oldest first."""
     with _connect() as connection:
@@ -342,36 +370,30 @@ def apply_pending_ratings(
         ).fetchone()
         if rating is None:
             raise ValueError("Рейтинг ещё не инициализирован.")
-        matches = connection.execute(
-            """
-            SELECT m.* FROM matches m
-            JOIN players p ON p.account_id = m.account_id
-            WHERE m.account_id = ? AND m.game_mode = 23 AND m.is_calibration = 0
-                AND m.start_time >= p.tracking_started_at AND m.win IN (0, 1)
-                AND NOT EXISTS (
-                    SELECT 1 FROM rating_history h
-                    WHERE h.account_id = m.account_id AND h.match_id = m.match_id
-                )
-            ORDER BY m.start_time ASC, m.match_id ASC
-            """,
-            (account_id,),
-        ).fetchall()
+        matches = connection.execute(_PENDING_RATINGS_QUERY, (account_id,)).fetchall()
         current = rating["current_rating"]
         changes = []
         for match in matches:
-            new_rating, delta, expected = calculate(current, bool(match["win"]))
+            performance = (performance_by_match or {}).get(match["match_id"], {})
+            bonus = performance.get("performance_bonus", 0)
+            new_rating, delta, expected = calculate(current, bool(match["win"]), bonus)
+            details = performance.get("performance_details")
             change = dict(
                 account_id=account_id, match_id=match["match_id"], rating_before=current,
                 expected_score=expected, result=match["win"], rating_delta=delta,
                 rating_after=new_rating, created_at=int(time.time()),
+                performance_score=performance.get("performance_score"), performance_bonus=bonus,
+                performance_details=json.dumps(details, allow_nan=False) if details is not None else None,
             )
             connection.execute(
                 """
                 INSERT INTO rating_history (
                     account_id, match_id, rating_before, expected_score,
-                    result, rating_delta, rating_after, created_at
+                    result, rating_delta, rating_after, created_at,
+                    performance_score, performance_bonus, performance_details
                 ) VALUES (:account_id, :match_id, :rating_before, :expected_score,
-                    :result, :rating_delta, :rating_after, :created_at)
+                    :result, :rating_delta, :rating_after, :created_at,
+                    :performance_score, :performance_bonus, :performance_details)
                 """,
                 change,
             )
@@ -415,7 +437,7 @@ def get_turbo_match_history(account_id: int, limit: int = 10) -> list[dict[str, 
     with _connect() as connection:
         rows = connection.execute(
             """
-            SELECT m.*, h.rating_delta, h.rating_after FROM matches m
+            SELECT m.*, h.rating_delta, h.rating_after, h.performance_bonus FROM matches m
             JOIN players p ON p.account_id = m.account_id
             LEFT JOIN rating_history h ON h.account_id = m.account_id AND h.match_id = m.match_id
             WHERE m.account_id = ? AND m.game_mode = 23 AND m.is_calibration = 0

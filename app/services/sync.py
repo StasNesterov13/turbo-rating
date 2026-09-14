@@ -8,9 +8,11 @@ import time
 from typing import Any
 from weakref import WeakValueDictionary
 
+import httpx
+
 from app import db
 from app.services.opendota import OpenDotaClient
-from app.services.rating import initialize_rating, apply_rating_changes
+from app.services.rating import initialize_rating, apply_rating_changes, get_match_performance
 
 
 logger = logging.getLogger(__name__)
@@ -46,6 +48,7 @@ class RatingUpdate:
     rating_before: float
     rating_delta: float
     rating_after: float
+    performance_bonus: int = 0
 
 
 @dataclass
@@ -98,6 +101,7 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
     player = db.get_player(account_id)
     if player is None:
         raise ValueError("Игрок ещё не добавлен в БД.")
+    performance_by_match = {}
     async with OpenDotaClient(
         api_key=api_key if api_key is not None else os.getenv("OPENDOTA_API_KEY") or None
     ) as client:
@@ -105,23 +109,38 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
         await initialize_rating(account_id, api_key=api_key)
         matches = await client.get_matches_for_sync(account_id, player["tracking_started_at"])
 
-    for match in matches:
-        if type(match.get("start_time")) is not int or type(match.get("match_id")) is not int:
-            raise ValueError("В ответе OpenDota отсутствует корректный match_id или start_time.")
+        for match in matches:
+            if type(match.get("start_time")) is not int or type(match.get("match_id")) is not int:
+                raise ValueError("В ответе OpenDota отсутствует корректный match_id или start_time.")
 
-    new_match_ids = set()
-    skipped_old = 0
-    skipped_duplicates = 0
-    for match in matches:
-        if match["start_time"] < player["tracking_started_at"]:
-            skipped_old += 1
-        elif db.save_match(account_id, match):
-            new_match_ids.add(match["match_id"])
-        else:
-            skipped_duplicates += 1
+        new_match_ids = set()
+        skipped_old = 0
+        skipped_duplicates = 0
+        for match in matches:
+            if match["start_time"] < player["tracking_started_at"]:
+                skipped_old += 1
+            elif db.save_match(account_id, match):
+                new_match_ids.add(match["match_id"])
+            else:
+                skipped_duplicates += 1
+
+        # This also recovers saved, unrated matches after an interruption.
+        # No network I/O is performed while holding the rating write transaction.
+        if db.get_final_standings() is None:
+            for pending in db.get_pending_rating_matches(account_id):
+                match_id = pending["match_id"]
+                try:
+                    full_match = await client.get_match(match_id)
+                except (httpx.HTTPError, ValueError) as exc:
+                    logger.warning(
+                        "Performance unavailable account_id=%s match_id=%s error=%s",
+                        account_id, match_id, type(exc).__name__,
+                    )
+                    full_match = None
+                performance_by_match[match_id] = get_match_performance(full_match, account_id)
 
     # Recover matches saved before an interrupted rating update as well as new ones.
-    rating_changes = apply_rating_changes(account_id)
+    rating_changes = apply_rating_changes(account_id, performance_by_match)
     stored = {
         match["match_id"]: match for match in db.get_player_matches(account_id)
     } if new_match_ids or rating_changes else {}
@@ -132,6 +151,7 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
             hero_id=stored[change["match_id"]]["hero_id"], win=bool(change["result"]),
             rating_before=change["rating_before"], rating_delta=change["rating_delta"],
             rating_after=change["rating_after"],
+            performance_bonus=change["performance_bonus"],
         ) for change in rating_changes
     ]
     nickname = profile.get("personaname")

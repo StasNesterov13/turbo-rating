@@ -95,6 +95,7 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.recent = self.enterContext(patch.object(
             OpenDotaClient, "get_matches_for_sync", new=AsyncMock(return_value=[])
         ))
+        self.full_match = self.enterContext(patch.object(OpenDotaClient, "get_match", new=AsyncMock(return_value={})))
         self.enterContext(patch.object(OpenDotaClient, "get_player", new=AsyncMock(
             side_effect=lambda account_id: {"profile": {
                 "account_id": account_id, "personaname": db.get_player(account_id)["nickname"],
@@ -225,12 +226,12 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         db.save_match(42, match(2, 1002))
         calls = 0
 
-        def fail_second(rating, win):
+        def fail_second(rating, win, bonus):
             nonlocal calls
             calls += 1
             if calls == 2:
                 raise RuntimeError("simulated interruption")
-            return calculate_new_rating(rating, win)
+            return calculate_new_rating(rating, win, bonus)
 
         with self.assertRaises(RuntimeError):
             db.apply_pending_ratings(42, fail_second)

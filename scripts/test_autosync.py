@@ -39,6 +39,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         self.fetch = self.enterContext(patch.object(
             OpenDotaClient, "get_matches_for_sync", new=AsyncMock(return_value=[])
         ))
+        self.enterContext(patch.object(OpenDotaClient, "get_match", new=AsyncMock(return_value={})))
         self.profile = self.enterContext(patch.object(OpenDotaClient, "get_player", new=AsyncMock(
             side_effect=lambda account_id: {"profile": {
                 "account_id": account_id, "personaname": db.get_player(account_id)["nickname"],
@@ -336,6 +337,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
 
 class RestartPaginationTests(unittest.IsolatedAsyncioTestCase):
     async def test_restart_fetches_more_than_20_and_rates_chronologically(self):
+        self.enterContext(patch.object(OpenDotaClient, "get_match", new=AsyncMock(return_value={})))
         self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         with tempfile.TemporaryDirectory(prefix="turbo-restart-test-") as directory:
             with patch.object(db, "DB_PATH", Path(directory) / "test.db"):

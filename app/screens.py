@@ -93,6 +93,11 @@ def format_matches(matches: list[dict], changes: dict[str, float]) -> str:
             f"{match['rating_delta']:+.0f} TR → {match['rating_after']:.0f} TR"
             if match["rating_delta"] is not None else "TR не начислен."
         )
+        if match["rating_delta"] is not None and (match.get("performance_bonus") or 0) > 0:
+            rating = (
+                f"{match['rating_delta']:+.0f} TR · performance +{match['performance_bonus']}"
+                f" → {match['rating_after']:.0f} TR"
+            )
         lines.append(f"{date}\n{result} · {get_hero_name(match['hero_id'])}\n{rating}")
     lines.append("\n".join(f"{label}: {change:+.0f} TR" for label, change in changes.items()))
     return "\n\n".join(lines)

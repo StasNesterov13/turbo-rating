@@ -51,6 +51,17 @@ class OpenDotaClient:
             raise ValueError("OpenDota вернул неожиданный формат данных игрока.")
         return player
 
+    async def get_match(self, match_id: int) -> dict[str, Any]:
+        """Return a full match, including both teams' player statistics."""
+        if type(match_id) is not int or match_id <= 0:
+            raise ValueError("match_id должен быть положительным целым числом.")
+        response = await self._client.get(f"matches/{match_id}")
+        response.raise_for_status()
+        match = response.json()
+        if not isinstance(match, dict) or match.get("match_id") != match_id:
+            raise ValueError("OpenDota вернул неожиданный формат данных матча.")
+        return match
+
     async def get_recent_matches(
         self, account_id: int, limit: int = 20, *, offset: int = 0
     ) -> list[dict[str, Any]]:

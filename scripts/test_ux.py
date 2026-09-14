@@ -260,7 +260,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((db.get_rating(42), db.get_rating_history(42)), before)
         self.assertEqual(format_rating_updates(
             [RatingUpdate(1, 1001, 44, True, 1053, 17, 1070)], position_before=4, position_after=3,
-        ), "🟢 Победа в Turbo\n\n+17 TR\n1053 → 1070\n\nМесто:\n#4 → #3")
+        ), "🟢 Победа в Turbo\n\n+17 TR\n1053 → 1070\n\nБаза: +17\n\nМесто:\n#4 → #3")
 
     async def test_stats_only_turbo_since_tracking_without_calibration(self):
         for game in (match(1, 1000), match(2, 1001), match(3, 1002, False),
@@ -417,9 +417,9 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         win = RatingUpdate(1, 1001, 44, True, 1000, 16, 1016)
         loss = RatingUpdate(2, 1002, 14, False, 1016, -17, 999)
         self.assertEqual(format_rating_updates([win]),
-                         "🟢 Победа в Turbo\n\n+16 TR\n1000 → 1016")
+                         "🟢 Победа в Turbo\n\n+16 TR\n1000 → 1016\n\nБаза: +16")
         self.assertEqual(format_rating_updates([loss]),
-                         "🔴 Поражение в Turbo\n\n-17 TR\n1016 → 999")
+                         "🔴 Поражение в Turbo\n\n-17 TR\n1016 → 999\n\nБаза: -17")
         group = format_rating_updates([win, loss])
         self.assertIn("🟢 Phantom Assassin  +16 TR", group)
         self.assertIn("🔴 Pudge  -17 TR", group)
@@ -461,6 +461,7 @@ class AccountParsingTests(unittest.TestCase):
 
 class OnboardingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
+        self.enterContext(patch.object(OpenDotaClient, "get_match", new=AsyncMock(return_value={})))
         self.enterContext(patch("app.season.now", return_value=datetime(2026, 9, 13, 12, tzinfo=timezone.utc)))
         from app import bot as bot_module
         self.module = importlib.reload(bot_module)
@@ -546,13 +547,11 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         response = await self.send(RATING_HELP_BUTTON)
         self.assertIsNone(await self.state())
         self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
-        self.assertEqual(response.text,
-                         "Turbo Rating\n\n"
-                         "Стартовый TR рассчитывается по последним 20 Turbo-матчам.\n\n"
-                         "После подключения:\n\n"
-                         "WIN → +25 TR\nLOSE → -25 TR\n\n"
-                         "На рейтинг влияет только результат Turbo-матча.")
-        for technical in ("Elo", "K-factor", "expected_score", "expected score"):
+        for explanation in ("последним 20 Turbo-матчам", "WIN → +25 TR", "LOSE → -25 TR",
+                            "ещё до +10 TR", "= +30 TR", "= -20 TR", "командный вклад",
+                            "главным фактором рейтинга"):
+            self.assertIn(explanation, response.text)
+        for technical in ("Elo", "K-factor", "expected_score", "expected score", "0.30", "0.35"):
             self.assertNotIn(technical, response.text)
         db.link_telegram_user(201, 42)
         registered = await self.send(RATING_HELP_BUTTON)

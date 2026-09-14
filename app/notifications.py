@@ -13,6 +13,13 @@ logger = logging.getLogger(__name__)
 MAX_DETAIL_LINES = 50
 
 
+def format_rating_breakdown(update: RatingUpdate) -> str:
+    text = f"База: {update.rating_delta - update.performance_bonus:+.0f}"
+    if update.performance_bonus > 0:
+        text += f"\nИгра: +{update.performance_bonus}"
+    return text
+
+
 def format_rating_updates(
     updates: list[RatingUpdate], *, manual: bool = False,
     position_before: int | None = None, position_after: int | None = None,
@@ -29,9 +36,10 @@ def format_rating_updates(
     if len(updates) == 1 and not manual:
         update = updates[0]
         title = "🟢 Победа в Turbo" if update.win else "🔴 Поражение в Turbo"
+        breakdown = "\n\n" + format_rating_breakdown(update)
         return (
             f"{title}\n\n"
-            f"{update.rating_delta:+.0f} TR\n{before:.0f} → {after:.0f}{position}"
+            f"{update.rating_delta:+.0f} TR\n{before:.0f} → {after:.0f}{breakdown}{position}"
         )
 
     lines = [] if manual else [f"🎮 Новые Turbo-матчи: {len(updates)}", ""]
@@ -41,6 +49,8 @@ def format_rating_updates(
         icon, result = ("🟢", "WIN") if update.win else ("🔴", "LOSE")
         label = f"Turbo {result}: " if manual else ""
         line = f"{icon} {label}{get_hero_name(update.hero_id)}  {update.rating_delta:+.0f} TR"
+        if update.performance_bonus > 0:
+            line += f" · performance +{update.performance_bonus}"
         units = len((line + "\n").encode("utf-16-le")) // 2
         # Leave room for the summary and the manual /sync response prefix.
         if detail_units + units > 3400:
