@@ -34,6 +34,12 @@ def match(match_id, start_time, win=True, game_mode=23, player_slot=0):
     )
 
 
+def rating_values(history):
+    """Retry bookkeeping may change while the actual saved rating stays fixed."""
+    return [{key: value for key, value in row.items()
+             if key not in ("performance_attempted_at", "performance_details")} for row in history]
+
+
 class MathematicsTests(unittest.TestCase):
     def test_no_history(self):
         self.assertEqual(calculate_initial_rating(0, 0), 1000)
@@ -147,7 +153,7 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.new_count, 0)
         self.assertEqual(second.rating_changes, [])
         self.assertEqual(db.get_rating(42), old_rating)
-        self.assertEqual(db.get_rating_history(42), old_history)
+        self.assertEqual(rating_values(db.get_rating_history(42)), rating_values(old_history))
 
     async def test_chronological_processing_with_fixed_delta(self):
         self.recent.return_value = [match(3, 1003), match(2, 1002, False), match(1, 1001)]
@@ -167,7 +173,7 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         legacy_matches = [match(101, 1001), match(102, 1002, False)]
         for game in legacy_matches:
             db.save_match(42, game)
-        # Existing records from the old formula must keep all their stored values.
+        # Retry metadata may change, but the old formula's base must be preserved.
         with db._connect() as connection:
             connection.executemany(
                 """INSERT INTO rating_history (account_id, match_id, rating_before,
@@ -192,11 +198,11 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event["rating_delta"], 25.0)
         self.assertEqual(event["expected_score"], 0.5)
         self.assertEqual(db.get_rating(42), {**old_rating, "current_rating": old_rating["current_rating"] + 25})
-        self.assertEqual(db.get_rating_history(42)[1:], old_history)
+        self.assertEqual(rating_values(db.get_rating_history(42)[1:]), rating_values(old_history))
         self.assertEqual([row for row in db.get_player_matches(42, include_calibration=True) if row["is_calibration"]], calibration)
         new_history = db.get_rating_history(42)
         self.assertEqual((await sync_player(42)).rating_changes, [])
-        self.assertEqual(db.get_rating_history(42), new_history)
+        self.assertEqual(rating_values(db.get_rating_history(42)), rating_values(new_history))
         self.history.assert_awaited_once()
 
     async def test_old_matches_and_unknown_results_do_not_rate(self):
@@ -325,7 +331,7 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
                 original = db.get_player(42)
                 self.assertIn("Test Player", await command("/add 42"))
                 self.assertEqual(db.get_player(42), original)
-                self.recent.return_value = [match(1, 1001)]
+                self.recent.return_value = [match(1, int(datetime.now(timezone.utc).timestamp()) - 1)]
                 self.assertIn(": 1", await command("/sync"))
                 history = await command("/matches")
                 self.assertIn("WIN · Hero #44\n+25 TR → 1025 TR", history)

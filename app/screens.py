@@ -82,10 +82,10 @@ def format_prizes(standings: list[dict], *, finished: bool = False, at: datetime
     return "\n".join(lines)
 
 
-def format_matches(matches: list[dict], changes: dict[str, float]) -> str:
+def format_matches(matches: list[dict]) -> str:
     lines = ["📜 История матчей"]
     if not matches:
-        lines.append("Матчей пока нет. Нажмите «Обновить» после игры.")
+        lines.append("За последние 7 дней матчей нет.")
     for match in matches:
         date = datetime.fromtimestamp(match["start_time"], timezone.utc).strftime("%d.%m")
         result = {1: "WIN", 0: "LOSE", None: "Результат пока неизвестен"}[match["win"]]
@@ -99,5 +99,4 @@ def format_matches(matches: list[dict], changes: dict[str, float]) -> str:
                 f" → {match['rating_after']:.0f} TR"
             )
         lines.append(f"{date}\n{result} · {get_hero_name(match['hero_id'])}\n{rating}")
-    lines.append("\n".join(f"{label}: {change:+.0f} TR" for label, change in changes.items()))
     return "\n\n".join(lines)

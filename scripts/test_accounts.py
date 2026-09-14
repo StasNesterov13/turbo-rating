@@ -64,7 +64,8 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
 
     def snapshot(self):
         with db._connect() as connection:
-            return list(connection.iterdump())
+            # First-visit bookkeeping is independent of account/rating mutations.
+            return [line for line in connection.iterdump() if not line.startswith('INSERT INTO "bot_users"')]
 
     def player_snapshot(self, account_id):
         return (db.get_player(account_id), db.get_rating(account_id),
@@ -183,7 +184,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsInstance(replies[0], AnswerCallbackQuery)
         self.profile.assert_not_awaited()
 
-        for next_input in ("/start", LINK_BUTTON, "/add", "44", "bad"):
+        for next_input in (LINK_BUTTON, "/add", "44", "bad"):
             with self.subTest(next_input=next_input):
                 response = (await self.send("/add 43", user_id=202))[0]
                 await self.send(next_input, user_id=202)
@@ -216,12 +217,27 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(await self.context().get_state())
         self.assertEqual(self.snapshot(), before)
 
+    async def test_unlinked_start_keeps_retry_button_and_pending_account(self):
+        self.profile.side_effect = httpx.ReadTimeout("private-url")
+        failed = (await self.send("/add 43", user_id=202))[0]
+        data = await self.context(202).get_data()
+        repeated = (await self.send("/start", user_id=202))[0]
+        self.assertEqual(repeated.text, self.module.LINK_PROMPT)
+        self.assertEqual(self.retry_data(repeated), self.retry_data(failed))
+        self.assertEqual(await self.context(202).get_data(), data)
+        self.profile.side_effect = lambda account_id: {"profile": {"account_id": account_id}}
+        response = (await self.click(self.retry_data(repeated), user_id=202))[-1]
+        self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
+        self.assertEqual(db.get_telegram_player(202)["account_id"], 43)
+        self.assertEqual(db.get_telegram_player(201)["account_id"], 42)
+
     async def test_menu_and_confirmation_do_not_mutate_database(self):
         before = self.snapshot()
         linked = (await self.send("/start"))[0]
         unlinked = (await self.send("/start", user_id=202))[0]
         self.assertEqual(linked.reply_markup, MAIN_KEYBOARD)
-        self.assertEqual(unlinked.reply_markup, UNLINKED_KEYBOARD)
+        self.assertTrue(unlinked.text.startswith(self.module.ONBOARDING_MESSAGE))
+        self.assertIsNotNone(unlinked.reply_markup.inline_keyboard)
         self.assertIn(CHANGE_BUTTON, [b.text for row in linked.reply_markup.keyboard for b in row])
         self.assertNotIn(LINK_BUTTON, [b.text for row in linked.reply_markup.keyboard for b in row])
         confirmation = (await self.send(CHANGE_BUTTON))[0]

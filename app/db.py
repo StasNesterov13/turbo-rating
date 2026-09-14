@@ -61,6 +61,11 @@ def init_db() -> None:
                 account_id INTEGER NOT NULL REFERENCES players(account_id)
             );
 
+            CREATE TABLE IF NOT EXISTS bot_users (
+                telegram_id INTEGER PRIMARY KEY,
+                created_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS ratings (
                 account_id INTEGER PRIMARY KEY REFERENCES players(account_id),
                 initial_rating REAL NOT NULL,
@@ -101,6 +106,9 @@ def init_db() -> None:
             ("performance_score", "REAL NULL"),
             ("performance_bonus", "INTEGER NOT NULL DEFAULT 0"),
             ("performance_details", "TEXT NULL"),
+            ("performance_attempted_at", "INTEGER NULL"),
+            ("performance_applied_at", "INTEGER NULL"),
+            ("performance_adjustment", "REAL NOT NULL DEFAULT 0"),
         ):
             if name not in history_columns:
                 connection.execute(f"ALTER TABLE rating_history ADD COLUMN {name} {definition}")
@@ -252,6 +260,24 @@ def get_player_matches(
     return [dict(row) for row in rows]
 
 
+def is_known_telegram_user(telegram_id: int) -> bool:
+    """Remember visitors before linking, including users linked before this migration."""
+    with _connect() as connection:
+        return connection.execute(
+            """SELECT 1 FROM bot_users WHERE telegram_id = ?
+               UNION ALL SELECT 1 FROM telegram_users WHERE telegram_id = ? LIMIT 1""",
+            (telegram_id, telegram_id),
+        ).fetchone() is not None
+
+
+def remember_telegram_user(telegram_id: int) -> None:
+    with _connect() as connection:
+        connection.execute(
+            """INSERT INTO bot_users (telegram_id, created_at) VALUES (?, ?)
+               ON CONFLICT (telegram_id) DO NOTHING""", (telegram_id, int(time.time())),
+        )
+
+
 def link_telegram_user(telegram_id: int, account_id: int) -> None:
     """Atomically replace one user's link, preserving all player data."""
     with _connect() as connection:
@@ -350,9 +376,98 @@ _PENDING_RATINGS_QUERY = """
 
 
 def get_pending_rating_matches(account_id: int) -> list[dict[str, Any]]:
-    """Read candidates before fetching performance; the write transaction rechecks them."""
+    """Read unrated candidates; the base rating transaction rechecks them."""
     with _connect() as connection:
         return [dict(row) for row in connection.execute(_PENDING_RATINGS_QUERY, (account_id,))]
+
+
+def get_pending_performance_matches(
+    account_id: int, *, recent_limit: int = 50, batch_size: int = 20,
+) -> list[dict[str, Any]]:
+    """Retry missing scores among recent rated games, rotating failed attempts."""
+    if any(type(value) is not int or value <= 0 for value in (recent_limit, batch_size)):
+        raise ValueError("Лимиты performance должны быть положительными целыми числами.")
+    with _connect() as connection:
+        return [dict(row) for row in connection.execute(
+            """
+            SELECT * FROM (
+                SELECT h.*, m.start_time FROM rating_history h
+                JOIN matches m ON m.account_id = h.account_id AND m.match_id = h.match_id
+                JOIN players p ON p.account_id = m.account_id
+                WHERE h.account_id = ? AND m.game_mode = 23 AND m.is_calibration = 0
+                    AND m.start_time >= p.tracking_started_at AND m.win IN (0, 1)
+                ORDER BY m.start_time DESC, m.match_id DESC LIMIT ?
+            ) WHERE performance_score IS NULL
+            ORDER BY COALESCE(performance_attempted_at, 0), start_time, match_id
+            LIMIT ?
+            """, (account_id, recent_limit, batch_size),
+        )]
+
+
+def apply_match_performance(
+    account_id: int, match_id: int, performance: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Atomically fill a missing score and add only the previously unapplied bonus.
+
+    Keep one history row per match and shift subsequent stored balances in actual
+    insertion order. The adjustment timestamp preserves historical TR and gains.
+    NULL remains pending; a calculated zero is final.
+    """
+    with _connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        if _finalize_season(connection) is not None:
+            return None
+        connection.execute("SAVEPOINT performance_update")
+        history = connection.execute(
+            """SELECT rowid AS history_id, * FROM rating_history
+               WHERE account_id = ? AND match_id = ? AND performance_score IS NULL""",
+            (account_id, match_id),
+        ).fetchone()
+        if history is None:
+            return None
+        now = int(time.time())
+        details = performance.get("performance_details")
+        connection.execute(
+            """UPDATE rating_history SET performance_attempted_at = ?, performance_details = ?
+               WHERE account_id = ? AND match_id = ?""",
+            (now, json.dumps(details, allow_nan=False) if details is not None else None, account_id, match_id),
+        )
+        change = None
+        if performance.get("performance_score") is not None:
+            bonus = performance["performance_bonus"]
+            adjustment = bonus - history["performance_bonus"]
+            current = connection.execute(
+                "SELECT current_rating FROM ratings WHERE account_id = ?", (account_id,),
+            ).fetchone()["current_rating"]
+            connection.execute(
+                """UPDATE rating_history SET performance_score = ?, performance_bonus = ?,
+                       performance_applied_at = ?, performance_adjustment = ?,
+                       rating_delta = rating_delta + ?, rating_after = rating_after + ?
+                   WHERE account_id = ? AND match_id = ?""",
+                (performance["performance_score"], bonus, now, adjustment,
+                 adjustment, adjustment, account_id, match_id),
+            )
+            connection.execute(
+                """UPDATE rating_history SET rating_before = rating_before + ?,
+                       rating_after = rating_after + ? WHERE account_id = ? AND rowid > ?""",
+                (adjustment, adjustment, account_id, history["history_id"]),
+            )
+            connection.execute(
+                "UPDATE ratings SET current_rating = current_rating + ? WHERE account_id = ?",
+                (adjustment, account_id),
+            )
+            change = dict(
+                account_id=account_id, match_id=match_id, result=history["result"],
+                rating_before=current, rating_delta=adjustment, rating_after=current + adjustment,
+                performance_bonus=adjustment, is_correction=True,
+                performance_score=performance["performance_score"],
+                performance_details=json.dumps(details, allow_nan=False) if details is not None else None,
+            )
+        if season.is_season_over():
+            connection.execute("ROLLBACK TO performance_update")
+            _finalize_season(connection)
+            return None
+        return change
 
 
 def apply_pending_ratings(
@@ -430,23 +545,29 @@ def get_rating_history(
         return [dict(row) for row in connection.execute(query, parameters).fetchall()]
 
 
-def get_turbo_match_history(account_id: int, limit: int = 10) -> list[dict[str, Any]]:
+def get_turbo_match_history(
+    account_id: int, limit: int = 10, *, since_timestamp: int | None = None,
+) -> list[dict[str, Any]]:
     """Read recent tracked Turbo matches with their original stored TR changes."""
     if type(limit) is not int or limit <= 0:
         raise ValueError("limit должен быть положительным целым числом.")
+    if since_timestamp is not None and type(since_timestamp) is not int:
+        raise ValueError("since_timestamp должен быть целым Unix-временем.")
+    query = """
+        SELECT m.*, h.rating_delta, h.rating_after, h.performance_bonus FROM matches m
+        JOIN players p ON p.account_id = m.account_id
+        LEFT JOIN rating_history h ON h.account_id = m.account_id AND h.match_id = m.match_id
+        WHERE m.account_id = ? AND m.game_mode = 23 AND m.is_calibration = 0
+            AND m.start_time >= p.tracking_started_at
+    """
+    parameters = [account_id]
+    if since_timestamp is not None:
+        query += " AND m.start_time >= ?"
+        parameters.append(since_timestamp)
+    query += " ORDER BY m.start_time DESC, m.match_id DESC LIMIT ?"
+    parameters.append(limit)
     with _connect() as connection:
-        rows = connection.execute(
-            """
-            SELECT m.*, h.rating_delta, h.rating_after, h.performance_bonus FROM matches m
-            JOIN players p ON p.account_id = m.account_id
-            LEFT JOIN rating_history h ON h.account_id = m.account_id AND h.match_id = m.match_id
-            WHERE m.account_id = ? AND m.game_mode = 23 AND m.is_calibration = 0
-                AND m.start_time >= p.tracking_started_at
-            ORDER BY m.start_time DESC, m.match_id DESC
-            LIMIT ?
-            """,
-            (account_id, limit),
-        ).fetchall()
+        rows = connection.execute(query, parameters).fetchall()
     return [dict(row) for row in rows]
 
 
@@ -569,15 +690,17 @@ def get_turbo_form(account_id: int) -> dict[str, Any]:
     return {"results": results, "streak": streak, "streak_win": streak_win}
 
 
-# The event timestamp is when TR was recorded, including delayed syncs. Within
-# one second, rowid preserves the actual insertion order, including backfills.
+# Base changes and recovered performance enter TR at their own recorded times.
 _RATING_AT_QUERY = """
     SELECT p.account_id, p.nickname,
-        COALESCE((
-            SELECT h.rating_after FROM rating_history h
-            WHERE h.account_id = r.account_id AND h.created_at <= :timestamp
-            ORDER BY h.created_at DESC, h.rowid DESC LIMIT 1
-        ), r.initial_rating) AS rating
+        r.initial_rating + COALESCE((
+            SELECT SUM(
+                CASE WHEN h.created_at <= :timestamp
+                    THEN h.rating_delta - h.performance_adjustment ELSE 0 END
+                + CASE WHEN h.performance_applied_at <= :timestamp
+                    THEN h.performance_adjustment ELSE 0 END
+            ) FROM rating_history h WHERE h.account_id = r.account_id
+        ), 0) AS rating
     FROM ratings r JOIN players p ON p.account_id = r.account_id
     WHERE p.tracking_started_at <= :timestamp
 """
@@ -627,10 +750,15 @@ def get_rating_change(account_id: int, since_timestamp: int) -> float | None:
     with _connect() as connection:
         row = connection.execute(
             """
-            SELECT COALESCE(SUM(h.rating_delta), 0.0) AS change
+            SELECT COALESCE(SUM(
+                CASE WHEN h.created_at >= :since
+                    THEN h.rating_delta - h.performance_adjustment ELSE 0 END
+                + CASE WHEN h.performance_applied_at >= :since
+                    THEN h.performance_adjustment ELSE 0 END
+            ), 0.0) AS change
             FROM ratings r LEFT JOIN rating_history h
-                ON h.account_id = r.account_id AND h.created_at >= ?
-            WHERE r.account_id = ? GROUP BY r.account_id
-            """, (since_timestamp, account_id),
+                ON h.account_id = r.account_id
+            WHERE r.account_id = :account_id GROUP BY r.account_id
+            """, {"since": since_timestamp, "account_id": account_id},
         ).fetchone()
     return row["change"] if row is not None else None

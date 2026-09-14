@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import AsyncMock, patch
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import Chat, Message, Update, User
+from aiogram.types import CallbackQuery, Chat, Message, Update, User
 import httpx
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +22,7 @@ if __package__ in (None, ""):
 from app import db
 from app.keyboards import (
     MAIN_KEYBOARD, UNLINKED_KEYBOARD, LINK_BUTTON, VIEW_TOP_BUTTON, RATING_HELP_BUTTON, SHARE_BUTTON, HISTORY_BUTTON, PRIZES_BUTTON,
+    TURBO_INFO_BUTTON, RATING_HELP_CALLBACK, get_info_keyboard,
 )
 from app.notifications import format_rating_updates, notify_rating_updates
 from app.services import heroes, sync as sync_service
@@ -203,6 +204,8 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                 text = message.answer.await_args.args[0]
                 if isinstance(failure, sync_service.MatchHistoryUnavailable):
                     self.assertEqual(text, bot_module.HISTORY_UNAVAILABLE_MESSAGE)
+                elif isinstance(failure, httpx.TimeoutException):
+                    self.assertIn("Синхронизация не завершилась", text)
                 elif not isinstance(failure, sqlite3.Error):
                     self.assertEqual(text, bot_module.OPENDOTA_ERROR_MESSAGE)
                 self.assertIn(type(failure).__name__, " ".join(logged.output))
@@ -239,6 +242,34 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                 await asyncio.gather(task, return_exceptions=True)
             self.assertNotIn(101, bot_module._sync_in_progress)
             self.assertNotIn(101, bot_module._sync_cooldowns)
+
+    async def test_slow_sync_reports_progress_then_timeout_and_cleans_up(self):
+        from app import bot as bot_module
+        progress, release = asyncio.Event(), asyncio.Event()
+
+        async def blocked(*args, **kwargs):
+            await release.wait()
+            raise httpx.ReadTimeout("secret")
+
+        async def answer(text, **kwargs):
+            if text.startswith("Синхронизирую"):
+                progress.set()
+
+        message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock(side_effect=answer))
+        with patch.object(bot_module, "sync_player", new=AsyncMock(side_effect=blocked)):
+            task = asyncio.create_task(bot_module.sync_command(message))
+            try:
+                await asyncio.wait_for(progress.wait(), 4)
+                self.assertFalse(task.done())
+                release.set()
+                await asyncio.wait_for(task, 2)
+            finally:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+        self.assertEqual(message.answer.await_count, 2)
+        self.assertIn("Синхронизация не завершилась", message.answer.await_args.args[0])
+        self.assertNotIn(101, bot_module._sync_in_progress)
+        self.assertNotIn(101, bot_module._sync_cooldowns)
 
     async def test_notifications_show_moved_unchanged_and_tied_positions_read_only(self):
         for account_id, rating in ((43, 1055), (44, 1100), (45, 1200)):
@@ -333,7 +364,8 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         dispatcher = Dispatcher()
         dispatcher.include_router(bot_module.router)
         for index in range(1, 7):
-            game = match(index, 1000 + index, index % 2 == 0, game_mode={4: 1, 5: 22, 6: 77}.get(index, 23))
+            game = match(index, int(datetime.now(timezone.utc).timestamp()) - 60 + index,
+                         index % 2 == 0, game_mode={4: 1, 5: 22, 6: 77}.get(index, 23))
             game["hero_id"] = 14 if index % 2 else 44
             db.save_match(42, game)
         apply_rating_changes(42)
@@ -358,7 +390,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                 buttons = [button.text for row in MAIN_KEYBOARD.keyboard for button in row]
                 self.assertEqual([[button.text for button in row] for row in MAIN_KEYBOARD.keyboard],
                                  [["👤 Профиль", "🥇 Топ"], ["📜 История матчей", PRIZES_BUTTON],
-                                  ["🔄 Обновить", RATING_HELP_BUTTON], ["🔁 Сменить Dota"]])
+                                  ["🔄 Обновить", "🔁 Сменить Dota"], [TURBO_INFO_BUTTON]])
                 for button, command in zip(buttons[:5], ("/profile", "/top", "/history", "/prizes", "/sync")):
                     self.assertEqual((await send(button)).text, (await send(command)).text)
                 self.assertEqual(sync.await_count, 2)
@@ -397,7 +429,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
                     self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
                 for button in buttons:
-                    if button in ("🥇 Топ", RATING_HELP_BUTTON, PRIZES_BUTTON):
+                    if button in ("🥇 Топ", TURBO_INFO_BUTTON, PRIZES_BUTTON):
                         continue
                     response = await send(button, user_id=999)
                     self.assertEqual(response.text, bot_module.ADD_ACCOUNT_MESSAGE)
@@ -504,16 +536,12 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         for user_id, value in enumerate(("165682118", "https://www.opendota.com/players/165682118",
                                          "https://www.dotabuff.com/players/165682118"), 201):
             response = await self.send("/start", user_id)
-            self.assertEqual(response.text, "Turbo Rating\n\nРейтинг Turbo-игр среди друзей.\n\n"
-                                            "Чтобы начать, привяжите Dota-профиль.")
-            self.assertIn("Чтобы начать, привяжите Dota-профиль.", response.text)
+            self.assertEqual(response.text, f"{self.module.ONBOARDING_MESSAGE}\n\n{self.module.LINK_PROMPT}")
+            self.assertEqual(response.parse_mode, "HTML")
             self.assertNotIn("Leader", response.text)
             self.assertNotIn("/add", response.text)
-            self.assertEqual(response.reply_markup, UNLINKED_KEYBOARD)
-            self.assertEqual(
-                [button.text for row in response.reply_markup.keyboard for button in row],
-                [LINK_BUTTON, VIEW_TOP_BUTTON, PRIZES_BUTTON, RATING_HELP_BUTTON],
-            )
+            self.assertIsNotNone(response.reply_markup.inline_keyboard)
+            self.assertEqual(await self.state(user_id), self.module.LinkDota.waiting_for_account.state)
             self.assertEqual((await self.send(VIEW_TOP_BUTTON, user_id)).text,
                              (await self.send("/top", user_id)).text)
             self.assertEqual((await self.send(LINK_BUTTON, user_id)).text, self.module.LINK_PROMPT)
@@ -560,7 +588,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         start = await self.send("/start")
         self.assertIn("1200 TR · место #1", start.text)
         self.assertNotIn("Как это работает:", start.text)
-        self.assertIn(RATING_HELP_BUTTON, [b.text for row in start.reply_markup.keyboard for b in row])
+        self.assertIn(TURBO_INFO_BUTTON, [b.text for row in start.reply_markup.keyboard for b in row])
         self.profile.assert_not_awaited()
         self.history.assert_not_awaited()
 
@@ -589,8 +617,95 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
             await self.send(LINK_BUTTON)
             response = await self.send(navigation)
             self.assertNotEqual(response.text, self.module.INVALID_ACCOUNT_MESSAGE)
-            self.assertIsNone(await self.state())
+            if navigation == "/start":
+                self.assertEqual(response.text, self.module.LINK_PROMPT)
+                self.assertEqual(await self.state(), self.module.LinkDota.waiting_for_account.state)
+            else:
+                self.assertIsNone(await self.state())
         self.profile.assert_not_awaited()
+
+    async def test_new_start_accepts_account_directly_then_opens_main_menu(self):
+        response = await self.send("/start")
+        self.assertLess(response.text.index("это ладдер"), response.text.index("Подключение Dota 2"))
+        self.assertTrue(db.is_known_telegram_user(201))
+        self.assertIsNone(db.get_telegram_player(201))
+        self.assertEqual((await self.send("165682118")).reply_markup, MAIN_KEYBOARD)
+        self.assertIsNone(await self.state())
+        repeated = await self.send("/start")
+        self.assertNotIn("это ладдер", repeated.text)
+        self.assertEqual(repeated.reply_markup, MAIN_KEYBOARD)
+        self.history.assert_awaited_once()
+
+    async def test_repeated_unlinked_start_preserves_input_and_survives_restart(self):
+        first = await self.send("/start")
+        context = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=201, user_id=201)
+        self.profile.side_effect = httpx.ReadTimeout("private-url")
+        failed = await self.send("165682118")
+        data = await context.get_data()
+        repeated = await self.send("/start")
+        self.assertEqual(repeated.text, self.module.LINK_PROMPT)
+        self.assertEqual(repeated.reply_markup, failed.reply_markup)
+        self.assertEqual(await context.get_data(), data)
+        # Memory state is lost on restart; the persisted visitor still skips onboarding.
+        await context.clear()
+        db.init_db()
+        db.init_db()
+        repeated = await self.send("/start")
+        self.assertEqual(repeated.text, self.module.LINK_PROMPT)
+        self.assertEqual(await self.state(), self.module.LinkDota.waiting_for_account.state)
+        # A separate Telegram visitor receives onboarding independently.
+        self.assertEqual((await self.send("/start", user_id=202)).text, first.text)
+        self.profile.side_effect = None
+        self.assertEqual((await self.send("165682118")).reply_markup, MAIN_KEYBOARD)
+
+    async def test_failed_onboarding_delivery_can_be_retried(self):
+        self.outgoing.side_effect = RuntimeError("Telegram unavailable")
+        with self.assertRaises(RuntimeError):
+            await self.send("/start")
+        self.assertFalse(db.is_known_telegram_user(201))
+        self.assertIsNone(await self.state())
+        self.outgoing.side_effect = None
+        self.assertTrue((await self.send("/start")).text.startswith(self.module.ONBOARDING_MESSAGE))
+
+    async def test_visitor_migration_preserves_linked_players_and_remembers_unlinked_users(self):
+        before = db.get_player(42), db.get_rating(42), db.get_tracked_account_ids()
+        with db._connect() as connection:
+            connection.execute("DROP TABLE bot_users")
+        db.init_db()
+        self.assertTrue(db.is_known_telegram_user(101))
+        self.assertFalse(db.is_known_telegram_user(201))
+        db.remember_telegram_user(201)
+        db.remember_telegram_user(201)
+        db.init_db()
+        self.assertEqual((await self.send("/start")).text, self.module.LINK_PROMPT)
+        self.assertIsNone(db.get_telegram_player(201))
+        self.assertEqual((await self.send("/start", user_id=101)).reply_markup, MAIN_KEYBOARD)
+        self.assertEqual((db.get_player(42), db.get_rating(42), db.get_tracked_account_ids()), before)
+        with db._connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM bot_users WHERE telegram_id = 201").fetchone()[0], 1)
+
+    async def test_info_can_be_reopened_and_rating_help_does_not_cancel_linking(self):
+        await self.send("/start")
+        context = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=201, user_id=201)
+        await context.update_data(pending_account_id=165682118, retry_token="keep")
+        for user_id in (201, 101):
+            response = await self.send(TURBO_INFO_BUTTON, user_id)
+            self.assertEqual(response.text, self.module.ONBOARDING_MESSAGE)
+            self.assertEqual(response.parse_mode, "HTML")
+            self.assertEqual(response.reply_markup, get_info_keyboard())
+        user = User(id=201, is_bot=False, first_name="Test")
+        message = Message(message_id=1, date=datetime.now(timezone.utc),
+                          chat=Chat(id=201, type="private"), from_user=user)
+        callback = CallbackQuery(id="info", from_user=user, chat_instance="test",
+                                 message=message, data=RATING_HELP_CALLBACK)
+        self.outgoing.reset_mock()
+        await self.dispatcher.feed_update(self.bot, Update(update_id=2, callback_query=callback))
+        self.assertEqual(self.outgoing.await_count, 2)
+        self.assertEqual(self.outgoing.await_args.args[0].text, self.module.RATING_HELP_MESSAGE)
+        self.assertEqual(await context.get_data(), {"pending_account_id": 165682118, "retry_token": "keep"})
+        self.assertEqual(await self.state(), self.module.LinkDota.waiting_for_account.state)
+        self.profile.assert_not_awaited()
+        self.history.assert_not_awaited()
 
     async def test_add_without_argument_uses_same_link_flow(self):
         self.assertEqual((await self.send("/add")).text, self.module.LINK_PROMPT)
@@ -627,7 +742,8 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("Последние:", (await self.send("/start")).text)
             response = await self.send("🔄 Обновить")
             current = db.get_rating(165682118)["current_rating"]
-            self.assertEqual(response.text, f"Данные актуальны.\n\nTurbo Rating: {current:.0f}")
+            self.assertIn(f"Turbo Rating: {current:.0f}", response.text)
+            self.assertIn("Performance пока недоступен для 2 матчей", response.text)
 
 
 if __name__ == "__main__":

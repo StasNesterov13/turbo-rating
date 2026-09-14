@@ -16,7 +16,7 @@ from app.services.rating import initialize_rating, apply_rating_changes, get_mat
 
 
 logger = logging.getLogger(__name__)
-# Waiting/running calls keep a strong reference; idle locks can be released.
+# Running calls keep a strong reference; idle locks can be released.
 _sync_locks: WeakValueDictionary[int, asyncio.Lock] = WeakValueDictionary()
 # Display-only timestamps; a restart waits for the next successful sync.
 _last_sync_times: dict[int, float] = {}
@@ -24,6 +24,11 @@ _last_sync_times: dict[int, float] = {}
 
 class MatchHistoryUnavailable(ValueError):
     """OpenDota explicitly reports that the player's history is unavailable."""
+
+
+def is_sync_in_progress(account_id: int) -> bool:
+    lock = _sync_locks.get(account_id)
+    return lock is not None and lock.locked()
 
 
 def get_last_sync_time(account_id: int) -> float | None:
@@ -49,6 +54,7 @@ class RatingUpdate:
     rating_delta: float
     rating_after: float
     performance_bonus: int = 0
+    is_correction: bool = False
 
 
 @dataclass
@@ -59,6 +65,8 @@ class SyncResult:
     skipped_duplicates: int = 0
     rating_changes: list[dict[str, Any]] = field(default_factory=list)
     rating_updates: list[RatingUpdate] = field(default_factory=list)
+    already_in_progress: bool = False
+    performance_pending: int = 0
 
     @property
     def new_count(self) -> int:
@@ -80,8 +88,12 @@ async def ensure_player(
 
 
 async def sync_player(account_id: int, *, api_key: str | None = None) -> SyncResult:
-    """Serialize synchronization per account within this application process."""
+    """Run at most one sync per account; overlapping callers return immediately."""
     lock = _sync_locks.setdefault(account_id, asyncio.Lock())
+    # There is no await between this check and acquisition of an unlocked lock.
+    if lock.locked():
+        logger.info("Sync already in progress account_id=%s", account_id)
+        return SyncResult(received_count=0, new_matches=[], already_in_progress=True)
     async with lock:
         logger.info("Sync started account_id=%s", account_id)
         try:
@@ -91,8 +103,9 @@ async def sync_player(account_id: int, *, api_key: str | None = None) -> SyncRes
             logger.error("Sync failed account_id=%s error=%s", account_id, type(exc).__name__)
             raise
         logger.info(
-            "Sync completed account_id=%s received=%s new_matches=%s rating_updates=%s",
+            "Sync completed account_id=%s received=%s new_matches=%s rating_updates=%s performance_pending=%s",
             account_id, result.received_count, result.new_count, len(result.rating_updates),
+            result.performance_pending,
         )
         return result
 
@@ -101,7 +114,7 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
     player = db.get_player(account_id)
     if player is None:
         raise ValueError("Игрок ещё не добавлен в БД.")
-    performance_by_match = {}
+    corrections = []
     async with OpenDotaClient(
         api_key=api_key if api_key is not None else os.getenv("OPENDOTA_API_KEY") or None
     ) as client:
@@ -124,23 +137,51 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
             else:
                 skipped_duplicates += 1
 
-        # This also recovers saved, unrated matches after an interruption.
-        # No network I/O is performed while holding the rating write transaction.
+        # Commit the base first, also recovering saved, unrated matches. A slow
+        # detail request or cancellation cannot lose this progress.
+        rating_changes = apply_rating_changes(account_id)
+        rated_ids = {change["match_id"] for change in rating_changes}
         if db.get_final_standings() is None:
-            for pending in db.get_pending_rating_matches(account_id):
+            for pending in db.get_pending_performance_matches(account_id):
+                if db.get_final_standings() is not None:
+                    break
                 match_id = pending["match_id"]
                 try:
                     full_match = await client.get_match(match_id)
+                    performance = get_match_performance(full_match, account_id)
                 except (httpx.HTTPError, ValueError) as exc:
                     logger.warning(
                         "Performance unavailable account_id=%s match_id=%s error=%s",
                         account_id, match_id, type(exc).__name__,
                     )
-                    full_match = None
-                performance_by_match[match_id] = get_match_performance(full_match, account_id)
+                    performance = get_match_performance(None, account_id)
+                correction = db.apply_match_performance(account_id, match_id, performance)
+                if correction is not None:
+                    logger.info(
+                        "Performance completed account_id=%s match_id=%s adjustment=%s",
+                        account_id, match_id, correction["rating_delta"],
+                    )
+                    if match_id not in rated_ids:
+                        corrections.append(correction)
 
-    # Recover matches saved before an interrupted rating update as well as new ones.
-    rating_changes = apply_rating_changes(account_id, performance_by_match)
+    # New matches are reported with their full delta; old matches report only
+    # the recovered adjustment. Build one continuous before/after summary.
+    if rating_changes:
+        history = {row["match_id"]: row for row in db.get_rating_history(account_id)}
+        current = rating_changes[0]["rating_before"]
+        for change in rating_changes:
+            saved = history[change["match_id"]]
+            for key in ("rating_delta", "performance_score", "performance_bonus", "performance_details"):
+                change[key] = saved[key]
+            change["rating_before"] = current
+            current += change["rating_delta"]
+            change["rating_after"] = current
+        for correction in corrections:
+            correction["rating_before"] = current
+            current += correction["rating_delta"]
+            correction["rating_after"] = current
+    rating_changes.extend(corrections)
+
     stored = {
         match["match_id"]: match for match in db.get_player_matches(account_id)
     } if new_match_ids or rating_changes else {}
@@ -152,6 +193,7 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
             rating_before=change["rating_before"], rating_delta=change["rating_delta"],
             rating_after=change["rating_after"],
             performance_bonus=change["performance_bonus"],
+            is_correction=change.get("is_correction", False),
         ) for change in rating_changes
     ]
     nickname = profile.get("personaname")
@@ -165,4 +207,5 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
         skipped_duplicates=skipped_duplicates,
         rating_changes=rating_changes,
         rating_updates=rating_updates,
+        performance_pending=len(db.get_pending_performance_matches(account_id, batch_size=50)),
     )

@@ -1,22 +1,51 @@
 """Minimal asynchronous OpenDota API client."""
 
+import asyncio
+import logging
 from types import TracebackType
 from typing import Any, Self
 
 import httpx
 
 
+logger = logging.getLogger(__name__)
+
+
 class OpenDotaClient:
     BASE_URL = "https://api.opendota.com/api/"
     TURBO_GAME_MODE = 23
 
-    def __init__(self, api_key: str | None = None, timeout: float = 20.0) -> None:
+    REQUEST_ATTEMPTS = 2
+    RETRY_STATUSES = {500, 502, 503, 504}
+
+    def __init__(self, api_key: str | None = None, timeout: float | httpx.Timeout | None = None) -> None:
         self._client = httpx.AsyncClient(
             base_url=self.BASE_URL,
             headers={"Accept": "application/json"},
             params={"api_key": api_key} if api_key else None,
-            timeout=timeout,
+            timeout=timeout if timeout is not None else httpx.Timeout(
+                connect=5.0, read=35.0, write=10.0, pool=5.0,
+            ),
         )
+
+    async def _get(self, path: str, **kwargs: Any) -> httpx.Response:
+        """Retry only transient failures of idempotent GETs, without logging URLs."""
+        for attempt in range(1, self.REQUEST_ATTEMPTS + 1):
+            try:
+                response = await self._client.get(path, **kwargs)
+                response.raise_for_status()
+                return response
+            except (httpx.ReadTimeout, httpx.ConnectTimeout) as exc:
+                error = type(exc).__name__
+                if attempt == self.REQUEST_ATTEMPTS:
+                    raise
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code not in self.RETRY_STATUSES or attempt == self.REQUEST_ATTEMPTS:
+                    raise
+                error = f"HTTP{exc.response.status_code}"
+            logger.warning("OpenDota retry endpoint=%s attempt=%s error=%s", path, attempt, error)
+            await asyncio.sleep(0.5 * 2 ** (attempt - 1))
+        raise AssertionError("Unreachable retry state")
 
     async def __aenter__(self) -> Self:
         await self._client.__aenter__()
@@ -44,8 +73,7 @@ class OpenDotaClient:
     async def get_player(self, account_id: int) -> dict[str, Any]:
         """Return the player data using a Dota account_id (Steam32)."""
         self._validate_account_id(account_id)
-        response = await self._client.get(f"players/{account_id}")
-        response.raise_for_status()
+        response = await self._get(f"players/{account_id}")
         player = response.json()
         if not isinstance(player, dict):
             raise ValueError("OpenDota вернул неожиданный формат данных игрока.")
@@ -55,8 +83,7 @@ class OpenDotaClient:
         """Return a full match, including both teams' player statistics."""
         if type(match_id) is not int or match_id <= 0:
             raise ValueError("match_id должен быть положительным целым числом.")
-        response = await self._client.get(f"matches/{match_id}")
-        response.raise_for_status()
+        response = await self._get(f"matches/{match_id}")
         match = response.json()
         if not isinstance(match, dict) or match.get("match_id") != match_id:
             raise ValueError("OpenDota вернул неожиданный формат данных матча.")
@@ -71,11 +98,10 @@ class OpenDotaClient:
             raise ValueError("limit должен быть положительным целым числом.")
         if type(offset) is not int or offset < 0:
             raise ValueError("offset должен быть неотрицательным целым числом.")
-        response = await self._client.get(
+        response = await self._get(
             f"players/{account_id}/matches",
             params={"limit": limit, "offset": offset, "significant": 0, "sort": "start_time"},
         )
-        response.raise_for_status()
         matches = response.json()
         if not isinstance(matches, list) or any(
             not isinstance(match, dict) for match in matches
@@ -119,7 +145,7 @@ class OpenDotaClient:
         if type(offset) is not int or offset < 0:
             raise ValueError("offset должен быть неотрицательным целым числом.")
 
-        response = await self._client.get(
+        response = await self._get(
             f"players/{account_id}/matches",
             params={
                 "game_mode": self.TURBO_GAME_MODE,
@@ -130,7 +156,6 @@ class OpenDotaClient:
                 "sort": "start_time",
             },
         )
-        response.raise_for_status()
         matches = response.json()
         if not isinstance(matches, list) or any(
             not isinstance(match, dict)

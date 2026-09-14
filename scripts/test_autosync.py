@@ -130,7 +130,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(db.get_leaderboard(limit=100)), 20)
         self.assertEqual(len(db.get_leaderboard(limit=2)), 2)
 
-    async def test_same_account_sync_is_serialized(self):
+    async def test_same_account_sync_returns_busy_without_a_second_request(self):
         self.player(42)
         entered, release, second_started = asyncio.Event(), asyncio.Event(), asyncio.Event()
         active = 0
@@ -167,10 +167,43 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(max_active, 1)
             self.assertEqual(len(first.rating_updates), 1)
             self.assertEqual(repeated.rating_updates, [])
+            self.assertTrue(repeated.already_in_progress)
+            self.assertEqual(calls, 1)
             self.assertEqual(db.get_rating(42)["current_rating"], 1025)
         finally:
             release.set()
             await asyncio.gather(*(task for task in (first_task, second_task) if task), return_exceptions=True)
+
+    async def test_manual_sync_during_autosync_is_busy_for_all_linked_users(self):
+        from app import bot as bot_module
+        self.player(42)
+        db.link_telegram_user(101, 42)
+        db.link_telegram_user(102, 42)
+        self.enterContext(patch.object(bot_module, "_sync_cooldowns", {}))
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def blocked(*args):
+            entered.set()
+            await release.wait()
+            return [match(1, 1001)]
+
+        self.fetch.side_effect = blocked
+        task = asyncio.create_task(sync_tracked_players(self.bot))
+        try:
+            await asyncio.wait_for(entered.wait(), 3)
+            for telegram_id in (101, 102):
+                message = SimpleNamespace(from_user=SimpleNamespace(id=telegram_id), answer=AsyncMock())
+                await asyncio.wait_for(bot_module.sync_command(message), 1)
+                self.assertIn("Обновление уже выполняется", message.answer.await_args.args[0])
+                self.assertNotIn(telegram_id, bot_module._sync_cooldowns)
+            self.fetch.assert_awaited_once()
+            release.set()
+            await asyncio.wait_for(task, 5)
+            self.assertEqual(db.get_rating(42)["current_rating"], 1025)
+            self.assertEqual(db.count_rated_matches(42), 1)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     async def test_different_accounts_can_fetch_concurrently(self):
         self.player(42)
@@ -331,7 +364,8 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
             notify.assert_not_awaited()
         self.fetch.return_value = [match(3, 1003, game_mode=22)]
         await sync_command(message)
-        self.assertEqual(message.answer.await_args.args[0], "Данные актуальны.\n\nTurbo Rating: 1000")
+        self.assertIn("Turbo Rating: 1000", message.answer.await_args.args[0])
+        self.assertIn("Performance пока недоступен для 2 матчей", message.answer.await_args.args[0])
         self.assertEqual(db.count_player_matches(42), 3)
 
 

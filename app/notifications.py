@@ -14,6 +14,8 @@ MAX_DETAIL_LINES = 50
 
 
 def format_rating_breakdown(update: RatingUpdate) -> str:
+    if update.is_correction:
+        return f"Performance: {update.rating_delta:+.0f}\nБаза уже учтена."
     text = f"База: {update.rating_delta - update.performance_bonus:+.0f}"
     if update.performance_bonus > 0:
         text += f"\nИгра: +{update.performance_bonus}"
@@ -36,20 +38,26 @@ def format_rating_updates(
     if len(updates) == 1 and not manual:
         update = updates[0]
         title = "🟢 Победа в Turbo" if update.win else "🔴 Поражение в Turbo"
+        if update.is_correction:
+            title = "Performance восстановлен"
         breakdown = "\n\n" + format_rating_breakdown(update)
         return (
             f"{title}\n\n"
             f"{update.rating_delta:+.0f} TR\n{before:.0f} → {after:.0f}{breakdown}{position}"
         )
 
-    lines = [] if manual else [f"🎮 Новые Turbo-матчи: {len(updates)}", ""]
+    new_count = sum(not update.is_correction for update in updates)
+    lines = [] if manual else [f"🎮 Новые Turbo-матчи: {new_count}"]
+    if len(updates) != new_count:
+        lines.append(f"Performance восстановлен: {len(updates) - new_count}")
+    lines.append("")
     shown = 0
     detail_units = 0
     for update in updates[:MAX_DETAIL_LINES]:
         icon, result = ("🟢", "WIN") if update.win else ("🔴", "LOSE")
-        label = f"Turbo {result}: " if manual else ""
+        label = "Performance: " if update.is_correction else (f"Turbo {result}: " if manual else "")
         line = f"{icon} {label}{get_hero_name(update.hero_id)}  {update.rating_delta:+.0f} TR"
-        if update.performance_bonus > 0:
+        if update.performance_bonus > 0 and not update.is_correction:
             line += f" · performance +{update.performance_bonus}"
         units = len((line + "\n").encode("utf-16-le")) // 2
         # Leave room for the summary and the manual /sync response prefix.

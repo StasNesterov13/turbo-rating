@@ -20,6 +20,8 @@ CHANGE_CONFIRM_PREFIX = "dota_change:confirm:"
 CHANGE_CANCEL_PREFIX = "dota_change:cancel:"
 VIEW_TOP_BUTTON = "🥇 Посмотреть топ"
 RATING_HELP_BUTTON = "ℹ️ Как считается рейтинг"
+TURBO_INFO_BUTTON = "ℹ️ Что такое Turbo Rating?"
+RATING_HELP_CALLBACK = "turbo_info:rating_help"
 FRIEND_CODE_HELP_CALLBACK = "dota_link:friend_code"
 MATCH_HISTORY_HELP_CALLBACK = "dota_link:match_history"
 LINK_RETRY_PREFIX = "dota_link:retry:"
@@ -28,8 +30,8 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=PROFILE_BUTTON), KeyboardButton(text=TOP_BUTTON)],
         [KeyboardButton(text=HISTORY_BUTTON), KeyboardButton(text=PRIZES_BUTTON)],
-        [KeyboardButton(text=SYNC_BUTTON), KeyboardButton(text=RATING_HELP_BUTTON)],
-        [KeyboardButton(text=CHANGE_BUTTON)],
+        [KeyboardButton(text=SYNC_BUTTON), KeyboardButton(text=CHANGE_BUTTON)],
+        [KeyboardButton(text=TURBO_INFO_BUTTON)],
     ],
     resize_keyboard=True,
     is_persistent=True,
@@ -39,15 +41,26 @@ UNLINKED_KEYBOARD = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=LINK_BUTTON)],
         [KeyboardButton(text=VIEW_TOP_BUTTON), KeyboardButton(text=PRIZES_BUTTON)],
-        [KeyboardButton(text=RATING_HELP_BUTTON)],
+        [KeyboardButton(text=TURBO_INFO_BUTTON)],
     ],
     resize_keyboard=True,
     is_persistent=True,
 )
 
 
-def get_main_keyboard(linked: bool) -> ReplyKeyboardMarkup:
-    return MAIN_KEYBOARD if linked else UNLINKED_KEYBOARD
+def get_main_keyboard(linked: bool, *, include_info: bool = True) -> ReplyKeyboardMarkup:
+    keyboard = MAIN_KEYBOARD if linked else UNLINKED_KEYBOARD
+    if include_info:
+        return keyboard
+    return keyboard.model_copy(update={"keyboard": [
+        row for row in keyboard.keyboard if all(button.text != TURBO_INFO_BUTTON for button in row)
+    ]})
+
+
+def get_info_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text=RATING_HELP_BUTTON, callback_data=RATING_HELP_CALLBACK),
+    ]])
 
 
 def get_link_keyboard(

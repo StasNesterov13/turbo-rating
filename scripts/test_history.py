@@ -17,7 +17,7 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app import db
-from app.keyboards import HISTORY_BUTTON, MAIN_KEYBOARD, UNLINKED_KEYBOARD
+from app.keyboards import HISTORY_BUTTON, MAIN_KEYBOARD, UNLINKED_KEYBOARD, TURBO_INFO_BUTTON, get_main_keyboard
 from app.notifications import notify_rating_updates
 from app.services import heroes
 from app.services.sync import RatingUpdate
@@ -167,17 +167,14 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.text, (await self.send(HISTORY_BUTTON)).text)
         for alias in ("/matches", "🎮 Матчи", "📈 История", "📈 История TR"):
             self.assertEqual(response.text, (await self.send(alias)).text)
-        self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
+        self.assertEqual(response.reply_markup, get_main_keyboard(True, include_info=False))
         self.assertEqual(response.text,
                          "📜 История матчей\n\n"
                          "13.09\nWIN · Phantom Assassin\n+17 TR → 1124 TR\n\n"
                          "12.09\nWIN · Phantom Assassin\n+1 TR → 1107 TR\n\n"
                          "12.09\nWIN · Phantom Assassin\n+12 TR → 1106 TR\n\n"
                          "11.09\nWIN · Phantom Assassin\n+14 TR → 1094 TR\n\n"
-                         "07.09\nWIN · Phantom Assassin\n+40 TR → 1080 TR\n\n"
-                         "03.09\nLOSE · Phantom Assassin\n-147 TR → 1040 TR\n\n"
-                         "19.08\nWIN · Phantom Assassin\n+200 TR → 1187 TR\n\n"
-                         "Сегодня: +18 TR\n7 дней: +84 TR\n30 дней: +137 TR")
+                         "07.09\nWIN · Phantom Assassin\n+40 TR → 1080 TR")
         rating = (await self.send("/rating")).text
         self.assertEqual(rating, "👤 Профиль\n\nДЕРЕВЕНСКИЙ\nDota ID: 42\n\n"
                                  "Turbo Rating: 1124 TR\nМесто: #3\nСтартовый TR: 987\n"
@@ -193,12 +190,11 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         empty = (await self.send(HISTORY_BUTTON)).text
         self.assertNotIn("Сейчас:", empty)
         self.assertNotIn("Рекорд:", empty)
-        self.assertIn("Сегодня: +0 TR\n7 дней: +0 TR\n30 дней: +0 TR", empty)
-        self.assertIn("Матчей пока нет.", empty)
+        self.assertEqual(empty, "📜 История матчей\n\nЗа последние 7 дней матчей нет.")
         for index in range(12):
             self.event(42, self.timestamp - 12 + index, 1)
         text = (await self.send("/history")).text
-        matches = text.split("\n\n")[1:-1]
+        matches = text.split("\n\n")[1:]
         self.assertEqual(len(matches), 10)
         self.assertEqual(matches[0], "13.09\nWIN · Phantom Assassin\n+1 TR → 1199 TR")
         self.assertEqual(matches[-1], "13.09\nWIN · Phantom Assassin\n+1 TR → 1190 TR")
@@ -226,6 +222,48 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("12.09\nLOSE · Phantom Assassin\n-12 TR → 1004 TR", text)
         self.assertIn("11.09\nWIN · Phantom Assassin\n+16 TR → 1016 TR", text)
         self.assertEqual(self.snapshot(), before)
+
+    async def test_seven_day_boundary_uses_match_time_and_keeps_old_rows(self):
+        self.player(42)
+        cutoff = self.timestamp - 7 * self.day
+        # All ratings were recorded today, including the match outside the window.
+        for mid, played_at in ((1, cutoff - 1), (2, cutoff), (3, cutoff + 1),
+                               (4, self.timestamp - 1), (5, self.timestamp - 1)):
+            self.event(42, self.timestamp, 25, match_id=mid, played_at=played_at)
+        before = self.snapshot()
+        with patch.object(db, "get_turbo_match_history", wraps=db.get_turbo_match_history) as query, patch.object(
+            db, "get_rating_change", side_effect=AssertionError("Unused period query"),
+        ), patch.object(db, "get_player_matches", side_effect=AssertionError("Do not load all matches")):
+            response = await self.send("/history")
+            query.assert_called_once_with(42, limit=10, since_timestamp=cutoff)
+        self.assertEqual([row["match_id"] for row in db.get_turbo_match_history(42, since_timestamp=cutoff)],
+                         [5, 4, 3, 2])
+        self.assertEqual(response.text.count("TR →"), 4)
+        self.assertNotIn("+25 TR → 1025 TR", response.text)
+        self.assertIn("+25 TR → 1050 TR", response.text)
+        self.assertEqual(db.count_player_matches(42), 5)
+        self.assertEqual(self.snapshot(), before)
+        buttons = [button.text for row in response.reply_markup.keyboard for button in row]
+        self.assertNotIn(TURBO_INFO_BUTTON, buttons)
+        for label in ("Сегодня", "7 дней", "30 дней"):
+            self.assertNotIn(label, buttons)
+
+    async def test_only_old_matches_give_empty_week_without_deleting_history(self):
+        self.player(42)
+        self.event(42, self.timestamp, 25, played_at=self.timestamp - 7 * self.day - 1)
+        before = self.snapshot()
+        self.assertEqual((await self.send(HISTORY_BUTTON)).text,
+                         "📜 История матчей\n\nЗа последние 7 дней матчей нет.")
+        self.assertEqual(len(db.get_turbo_match_history(42)), 1)
+        self.assertEqual(self.snapshot(), before)
+
+    async def test_screens_do_not_query_or_show_rating_changes_by_period(self):
+        self.demo()
+        with patch.object(db, "get_rating_change", side_effect=AssertionError("Unused period query")):
+            for command in ("/start", "/profile", "/top", "/prizes", "/history"):
+                response = await self.send(command)
+                for label in ("Сегодня:", "7 дней:", "30 дней:", "За сегодня", "За 7 дней", "За 30 дней"):
+                    self.assertNotIn(label, response.text)
 
     async def test_top_arrows_no_movement_for_new_player_and_own_marker(self):
         self.demo()

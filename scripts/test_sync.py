@@ -38,6 +38,9 @@ async def check_sync(account_id: int) -> None:
         )
 
     sync_result = await sync_player(account_id)
+    if sync_result.already_in_progress:
+        print("Синхронизация этого аккаунта уже выполняется.")
+        return
     print()
     print(f"Получено матчей из OpenDota: {sync_result.received_count}")
     print(f"Пропущено до начала отслеживания: {sync_result.skipped_old}")
@@ -50,7 +53,9 @@ async def check_sync(account_id: int) -> None:
         print(f"{match['match_id']} | {mode} | {result}")
     print(f"Всего матчей игрока в БД: {db.count_player_matches(account_id)}")
     rating = db.get_rating(account_id)
-    print(f"Turbo-матчей начислено в этом sync: {len(sync_result.rating_changes)}")
+    print(f"Начислений TR в этом sync: {len(sync_result.rating_changes)}")
+    print(f"Из них восстановлений performance: {sum(u.is_correction for u in sync_result.rating_updates)}")
+    print(f"Недавних матчей в ожидании performance: {sync_result.performance_pending}")
     if rating is not None:
         print(f"Turbo Rating: {rating['current_rating']:.0f}")
 
