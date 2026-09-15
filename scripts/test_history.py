@@ -64,8 +64,8 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
             connection.execute(
                 """INSERT INTO rating_history
                     (account_id, match_id, rating_before, expected_score, result,
-                     rating_delta, rating_after, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                (account_id, match_id, before, 0.5, int(delta > 0), delta, before + delta, recorded_at),
+                     rating_delta, rating_after, created_at, season_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (account_id, match_id, before, 0.5, int(delta > 0), delta, before + delta, recorded_at, "2026-09"),
             )
             connection.execute("UPDATE ratings SET current_rating = ? WHERE account_id = ?", (before + delta, account_id))
 
@@ -171,7 +171,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.text,
                          "📜 История матчей\n\n"
                          "13.09\nWIN · Phantom Assassin\n+17 TR → 1124 TR\n\n"
-                         "12.09\nWIN · Phantom Assassin\n+1 TR → 1107 TR\n\n"
+                         "13.09\nWIN · Phantom Assassin\n+1 TR → 1107 TR\n\n"
                          "12.09\nWIN · Phantom Assassin\n+12 TR → 1106 TR\n\n"
                          "11.09\nWIN · Phantom Assassin\n+14 TR → 1094 TR\n\n"
                          "07.09\nWIN · Phantom Assassin\n+40 TR → 1080 TR")

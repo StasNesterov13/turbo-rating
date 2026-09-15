@@ -55,6 +55,7 @@ class RatingUpdate:
     rating_after: float
     performance_bonus: int = 0
     is_correction: bool = False
+    season_id: str | None = None
 
 
 @dataclass
@@ -111,6 +112,7 @@ async def sync_player(account_id: int, *, api_key: str | None = None) -> SyncRes
 
 
 async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncResult:
+    db.ensure_current_season()
     player = db.get_player(account_id)
     if player is None:
         raise ValueError("Игрок ещё не добавлен в БД.")
@@ -141,28 +143,27 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
         # detail request or cancellation cannot lose this progress.
         rating_changes = apply_rating_changes(account_id)
         rated_ids = {change["match_id"] for change in rating_changes}
-        if db.get_final_standings() is None:
-            for pending in db.get_pending_performance_matches(account_id):
-                if db.get_final_standings() is not None:
-                    break
-                match_id = pending["match_id"]
-                try:
-                    full_match = await client.get_match(match_id)
-                    performance = get_match_performance(full_match, account_id)
-                except (httpx.HTTPError, ValueError) as exc:
-                    logger.warning(
-                        "Performance unavailable account_id=%s match_id=%s error=%s",
-                        account_id, match_id, type(exc).__name__,
-                    )
-                    performance = get_match_performance(None, account_id)
-                correction = db.apply_match_performance(account_id, match_id, performance)
-                if correction is not None:
-                    logger.info(
-                        "Performance completed account_id=%s match_id=%s adjustment=%s",
-                        account_id, match_id, correction["rating_delta"],
-                    )
-                    if match_id not in rated_ids:
-                        corrections.append(correction)
+        for pending in db.get_pending_performance_matches(account_id):
+            if pending["season_id"] != db.ensure_current_season()["season_id"]:
+                break
+            match_id = pending["match_id"]
+            try:
+                full_match = await client.get_match(match_id)
+                performance = get_match_performance(full_match, account_id)
+            except (httpx.HTTPError, ValueError) as exc:
+                logger.warning(
+                    "Performance unavailable account_id=%s match_id=%s error=%s",
+                    account_id, match_id, type(exc).__name__,
+                )
+                performance = get_match_performance(None, account_id)
+            correction = db.apply_match_performance(account_id, match_id, performance)
+            if correction is not None:
+                logger.info(
+                    "Performance completed account_id=%s match_id=%s adjustment=%s",
+                    account_id, match_id, correction["rating_delta"],
+                )
+                if match_id not in rated_ids:
+                    corrections.append(correction)
 
     # New matches are reported with their full delta; old matches report only
     # the recovered adjustment. Build one continuous before/after summary.
@@ -181,6 +182,10 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
             current += correction["rating_delta"]
             correction["rating_after"] = current
     rating_changes.extend(corrections)
+    # A request may span midnight. September changes stay in stored history;
+    # do not present them as changes to the newly reset October balance.
+    current_id = db.ensure_current_season()["season_id"]
+    rating_changes = [change for change in rating_changes if change["season_id"] == current_id]
 
     stored = {
         match["match_id"]: match for match in db.get_player_matches(account_id)
@@ -194,6 +199,7 @@ async def _sync_player(account_id: int, *, api_key: str | None = None) -> SyncRe
             rating_after=change["rating_after"],
             performance_bonus=change["performance_bonus"],
             is_correction=change.get("is_correction", False),
+            season_id=change["season_id"],
         ) for change in rating_changes
     ]
     nickname = profile.get("personaname")

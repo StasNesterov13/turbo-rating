@@ -25,7 +25,7 @@ from app.services.rating import (
     calculate_performance_score, calculate_rating_delta, get_match_performance,
 )
 from app.services.sync import sync_player
-from scripts.test_rating import match
+from scripts.test_rating import match, timestamp
 
 
 def full_match(kind="carry", *, account_id=42, dire=False, match_id=1):
@@ -179,7 +179,7 @@ class PerformanceSyncTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temporary.cleanup)
         self.enterContext(patch.object(db, "DB_PATH", Path(temporary.name) / "test.db"))
         db.init_db()
-        db.add_player(42, "Player", 1000)
+        db.add_player(42, "Player", timestamp(1000))
         db.create_rating(42, 100, [], 0)
         self.enterContext(patch.object(OpenDotaClient, "get_player", new=AsyncMock(return_value={
             "profile": {"account_id": 42, "personaname": "Player"},
@@ -355,21 +355,21 @@ class PerformanceSyncTests(unittest.IsolatedAsyncioTestCase):
     def test_delayed_correction_keeps_recorded_periods_and_balances_consistent(self):
         # Delayed match 1 is inserted after match 2: use insertion order for balances.
         db.save_match(42, match(2, 1002, False))
-        with patch.object(db.time, "time", return_value=2000):
+        with patch.object(db.time, "time", return_value=timestamp(2000)):
             apply_rating_changes(42)
         db.save_match(42, match(1, 1001))
-        with patch.object(db.time, "time", return_value=3000):
+        with patch.object(db.time, "time", return_value=timestamp(3000)):
             apply_rating_changes(42)
-        with patch.object(db.time, "time", return_value=4000):
+        with patch.object(db.time, "time", return_value=timestamp(4000)):
             db.apply_match_performance(42, 2, get_match_performance(full_match(match_id=2), 42))
         rows = db.get_rating_history(42, by_recorded_time=True)
         self.assertEqual([r["rating_after"] for r in rows], [105, 80])
         self.assertEqual(rows[0]["rating_before"], 80)
-        self.assertEqual([db.get_rating_at(42, t) for t in (1999, 2000, 3000, 3999, 4000)],
+        self.assertEqual([db.get_rating_at(42, timestamp(t)) for t in (1999, 2000, 3000, 3999, 4000)],
                          [100, 75, 100, 100, 105])
-        self.assertEqual(db.get_rating_change(42, 3500), 5)
-        self.assertEqual(db.get_rating_change(42, 2500), 30)
-        self.assertEqual(db.get_rating_change(42, 1500), 5)
+        self.assertEqual(db.get_rating_change(42, timestamp(3500)), 5)
+        self.assertEqual(db.get_rating_change(42, timestamp(2500)), 30)
+        self.assertEqual(db.get_rating_change(42, timestamp(1500)), 5)
 
     def test_performance_batch_is_bounded_and_failures_rotate(self):
         for mid in range(1, 56):
@@ -384,7 +384,7 @@ class PerformanceSyncTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_season_closed_does_not_fetch_performance(self):
         self.recent.return_value = [match(1, 1001)]
-        with patch.object(season, "now", return_value=season.SEASON_END_AT):
+        with patch.object(season, "now", return_value=season.bounds("2026-09")[1]):
             self.assertEqual((await sync_player(42)).rating_updates, [])
         self.fetch.assert_not_awaited()
 
@@ -394,12 +394,12 @@ class PerformanceSyncTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(season, "now", return_value=datetime(2026, 9, 13, tzinfo=timezone.utc)) as clock:
             async def details(mid):
                 self.assertEqual(db.get_rating(42)["current_rating"], 150)
-                clock.return_value = season.SEASON_END_AT
+                clock.return_value = season.bounds("2026-09")[1]
                 return full_match(match_id=mid)
             self.fetch.side_effect = details
             result = await sync_player(42)
-        self.assertEqual([u.rating_delta for u in result.rating_updates], [25, 25])
-        self.assertEqual(db.get_rating(42)["current_rating"], 150)
+        self.assertEqual(result.rating_updates, [])
+        self.assertEqual(db.get_rating(42)["current_rating"], 1000)
         self.assertEqual(db.get_final_standings()[0]["current_rating"], 150)
         self.assertTrue(all(r["performance_score"] is None for r in db.get_rating_history(42)))
         self.fetch.assert_awaited_once()

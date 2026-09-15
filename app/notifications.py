@@ -75,6 +75,10 @@ def format_rating_updates(
 async def notify_rating_updates(bot: Bot, account_id: int, updates: list[RatingUpdate]) -> None:
     if not updates:
         return
+    current_id = db.ensure_current_season()["season_id"]
+    updates = [update for update in updates if update.season_id in (None, current_id)]
+    if not updates:
+        return
     before = db.get_leaderboard_position(account_id, rating=updates[0].rating_before)
     after = db.get_leaderboard_position(account_id, rating=updates[-1].rating_after)
     text = format_rating_updates(

@@ -23,7 +23,7 @@ from app.notifications import format_rating_updates, notify_rating_updates
 from app.services.opendota import OpenDotaClient
 from app.services import sync as sync_service
 from app.services.sync import RatingUpdate, SyncResult, sync_player
-from scripts.test_rating import match
+from scripts.test_rating import match, timestamp
 
 
 class AutosyncTests(unittest.IsolatedAsyncioTestCase):
@@ -49,7 +49,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         self.bot = AsyncMock(spec=Bot)
 
     def player(self, account_id, rating=1000):
-        db.add_player(account_id, f"Player {account_id}", 1000)
+        db.add_player(account_id, f"Player {account_id}", timestamp(1000))
         db.create_rating(account_id, float(rating), [], 0)
 
     async def test_successful_empty_sync_refreshes_name_and_time_only(self):
@@ -118,7 +118,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         for account_id, rating in ((42, 1000), (43, 1200), (44, 1000)):
             self.player(account_id, rating)
             db.link_telegram_user(1000 + account_id, account_id)
-        db.add_player(45, "No rating", 1000)
+        db.add_player(45, "No rating", timestamp(1000))
         db.link_telegram_user(101, 42)
         db.link_telegram_user(102, 42)
         self.assertEqual([p["account_id"] for p in db.get_leaderboard()], [43, 42, 44])
@@ -249,7 +249,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.new_count, 3)
         self.assertTrue(all(isinstance(u, RatingUpdate) for u in updates))
         self.assertEqual([u.match_id for u in updates], [1, 3])
-        self.assertEqual([u.start_time for u in updates], [1001, 1003])
+        self.assertEqual([u.start_time for u in updates], [timestamp(1001), timestamp(1003)])
         self.assertEqual([u.win for u in updates], [True, False])
         self.assertEqual(updates[0].hero_id, 44)
         self.assertEqual(updates[0].rating_before, 1000)
@@ -264,7 +264,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         db.link_telegram_user(102, 42)
         self.fetch.return_value = [match(2, 1002, False), match(1, 1001)]
         await sync_tracked_players(self.bot)
-        self.fetch.assert_awaited_once_with(42, 1000)
+        self.fetch.assert_awaited_once_with(42, timestamp(1000))
         self.assertEqual(self.bot.send_message.await_count, 2)
         first, second = self.bot.send_message.await_args_list
         self.assertEqual([first.args[0], second.args[0]], [101, 102])
@@ -332,7 +332,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         from app.bot import add_command, top_command, sync_command
 
         message = SimpleNamespace(from_user=SimpleNamespace(id=101), answer=AsyncMock())
-        db.add_player(42, "Test Player", 1000)
+        db.add_player(42, "Test Player", timestamp(1000))
         with patch.object(OpenDotaClient, "get_player", new=AsyncMock(return_value={
             "profile": {"account_id": 42, "personaname": "Test Player"}
         })):
@@ -350,7 +350,7 @@ class AutosyncTests(unittest.IsolatedAsyncioTestCase):
         message.answer.reset_mock()
         await top_command(message)
         self.assertEqual(message.answer.await_args.args[0].split("\n\n💰 Призы:")[0],
-                         "Turbo Rating\n\n🥇 Player 43 — 1200  —\n🥈 Test Player — 1000  — ← вы")
+                         "Turbo Rating\nСезон: Сентябрь 2026\n\n🥇 Player 43 — 1200  —\n🥈 Test Player — 1000  — ← вы")
         self.fetch.return_value = [match(2, 1002, False), match(1, 1001)]
         message.answer.reset_mock()
         with patch("app.notifications.notify_rating_updates", new=AsyncMock()) as notify:
@@ -376,7 +376,7 @@ class RestartPaginationTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory(prefix="turbo-restart-test-") as directory:
             with patch.object(db, "DB_PATH", Path(directory) / "test.db"):
                 db.init_db()
-                db.add_player(42, "Restart", 1000)
+                db.add_player(42, "Restart", timestamp(1000))
                 db.create_rating(42, 1000, [], 0)
                 data = [match(i, 1120 - i) for i in range(125)]
 
@@ -389,7 +389,7 @@ class RestartPaginationTests(unittest.IsolatedAsyncioTestCase):
                     result = await sync_player(42)
                     self.assertEqual([c.kwargs["offset"] for c in fetch.await_args_list], [0, 50, 100])
                     self.assertEqual(len(result.rating_updates), 121)
-                    self.assertEqual([u.start_time for u in result.rating_updates], list(range(1000, 1121)))
+                    self.assertEqual([u.start_time for u in result.rating_updates], [timestamp(t) for t in range(1000, 1121)])
                     self.assertEqual(result.rating_updates[-1].rating_after, db.get_rating(42)["current_rating"])
                     self.assertEqual((await sync_player(42)).rating_updates, [])
 

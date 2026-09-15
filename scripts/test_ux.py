@@ -31,7 +31,7 @@ from app.services.accounts import parse_dota_account_id
 from app.services.opendota import OpenDotaClient
 from app.services.rating import apply_rating_changes
 from app.services.sync import RatingUpdate, SyncResult
-from scripts.test_rating import match
+from scripts.test_rating import match, timestamp
 
 
 class HeroTests(unittest.IsolatedAsyncioTestCase):
@@ -121,7 +121,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(bot_module, "_sync_cooldowns", {}))
         self.enterContext(patch.object(bot_module, "_sync_in_progress", set()))
         db.init_db()
-        db.add_player(42, "Test Player", 1000)
+        db.add_player(42, "Test Player", timestamp(1000))
         db.create_rating(42, 1000, [], 0)
         db.link_telegram_user(101, 42)
 
@@ -146,7 +146,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
         text = message.answer.await_args.args[0]
         self.assertEqual(text, "👤 Профиль\n\nTest Player\nDota ID: 42\n\n"
                                "Turbo Rating: 1000 TR\nМесто: #1\nСтартовый TR: 1000\n"
-                               "Рекорд: 1000 TR\n\nДата подключения:\n01.01.1970")
+                               "Рекорд: 1000 TR\n\nДата подключения:\n01.09.2026")
         self.assertEqual((db.get_rating(42), db.get_rating_history(42)), before)
 
     async def test_home_excludes_matches_with_empty_or_populated_history(self):
@@ -273,11 +273,11 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_notifications_show_moved_unchanged_and_tied_positions_read_only(self):
         for account_id, rating in ((43, 1055), (44, 1100), (45, 1200)):
-            db.add_player(account_id, str(account_id), 1000)
+            db.add_player(account_id, str(account_id), timestamp(1000))
             db.create_rating(account_id, rating, [], 0)
             db.link_telegram_user(account_id, account_id)
         db.link_telegram_user(102, 43)  # Multiple subscribers cannot inflate rank.
-        db.add_player(46, "Inactive", 1000)
+        db.add_player(46, "Inactive", timestamp(1000))
         db.create_rating(46, 9000, [], 0)
         with db._connect() as connection:
             connection.execute("UPDATE ratings SET current_rating = 1070 WHERE account_id = 42")
@@ -338,10 +338,10 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
     async def test_leaderboard_position_stable_ties_and_below_top_twenty(self):
         from app.bot import top_command
         for account_id in range(1, 27):
-            db.add_player(account_id, f"Player {account_id}", 1000)
+            db.add_player(account_id, f"Player {account_id}", timestamp(1000))
             db.create_rating(account_id, 1000, [], 0)
             db.link_telegram_user(1000 + account_id, account_id)
-        db.add_player(99, "Unrated", 1000)
+        db.add_player(99, "Unrated", timestamp(1000))
         db.link_telegram_user(102, 42)
         self.assertEqual(db.get_leaderboard_position(42)["position"], 27)
         self.assertIsNone(db.get_leaderboard_position(99))
@@ -405,7 +405,7 @@ class UXTests(unittest.IsolatedAsyncioTestCase):
                 profile = (await send("/profile")).text
                 self.assertEqual(profile, "👤 Профиль\n\nTest Player\nDota ID: 42\n\n"
                                           "Turbo Rating: 975 TR\nМесто: #1\nСтартовый TR: 1000\n"
-                                          "Рекорд: 1000 TR\n\nДата подключения:\n01.01.1970")
+                                          "Рекорд: 1000 TR\n\nДата подключения:\n01.09.2026")
                 rating = (await send("/rating")).text
                 self.assertEqual(profile, rating)
                 for alias in ("/stats", "📊 Статистика"):
@@ -501,7 +501,7 @@ class OnboardingTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temporary.cleanup)
         self.enterContext(patch.object(db, "DB_PATH", Path(temporary.name) / "test.db"))
         db.init_db()
-        db.add_player(42, "Leader", 1000)
+        db.add_player(42, "Leader", timestamp(1000))
         db.create_rating(42, 1200, [], 0)
         db.link_telegram_user(101, 42)
         self.dispatcher = Dispatcher()

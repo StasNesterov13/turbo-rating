@@ -15,7 +15,7 @@ logger = logging.getLogger(__name__)
 
 
 async def sync_tracked_players(bot: Bot, *, api_key: str | None = None) -> None:
-    db.get_final_standings()
+    db.ensure_current_season()
     for account_id in db.get_tracked_account_ids():
         try:
             result = await sync_player(account_id, api_key=api_key)
@@ -35,3 +35,16 @@ async def run_autosync(bot: Bot, *, api_key: str | None = None) -> None:
             await asyncio.sleep(AUTO_SYNC_INTERVAL_SECONDS)
     finally:
         logger.info("Autosync stopped")
+
+
+async def run_season_rollover() -> None:
+    """Independent of API latency and autosync; recover on every startup too."""
+    from app import season
+    while True:
+        try:
+            current = db.ensure_current_season()
+            delay = max(0.1, min(60, current["ends_at"] - season.now().timestamp()))
+        except Exception as exc:
+            logger.error("Season rollover failed error=%s", type(exc).__name__)
+            delay = 5
+        await asyncio.sleep(delay)

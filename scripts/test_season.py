@@ -1,9 +1,11 @@
-"""Offline prize screens and irreversible season closure using real SQLite."""
+"""Monthly rollover, real SQLite migrations/concurrency and Telegram screens."""
 
 import asyncio
-from datetime import timedelta, timezone
+from contextlib import closing
+from datetime import datetime, timedelta, timezone
 import importlib
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest.mock import AsyncMock, patch
@@ -13,21 +15,30 @@ from aiogram.types import Chat, Message, Update, User
 import httpx
 
 from app import db, season
-from app.autosync import sync_tracked_players
-from app.keyboards import LINK_BUTTON, MAIN_KEYBOARD, PRIZES_BUTTON, UNLINKED_KEYBOARD
+from app.autosync import run_season_rollover, sync_tracked_players
+from app.keyboards import PRIZES_BUTTON
 from app.services.opendota import OpenDotaClient
 from app.services.rating import apply_rating_changes, calculate_new_rating, initialize_rating
 from app.services.sync import sync_player
 from scripts.test_rating import match
 
 
-class CountdownTests(unittest.TestCase):
-    def test_moscow_deadline_and_exact_boundary(self):
-        self.assertEqual(season.SEASON_END_AT.astimezone(timezone.utc).isoformat(), "2026-10-01T20:59:59+00:00")
-        self.assertFalse(season.is_season_over(season.SEASON_END_AT - timedelta(microseconds=1)))
-        self.assertTrue(season.is_season_over(season.SEASON_END_AT))
+class CalendarTests(unittest.TestCase):
+    def test_month_boundary_uses_moscow_not_utc(self):
+        start, end = season.bounds("2026-09")
+        self.assertEqual(end.isoformat(), "2026-10-01T00:00:00+03:00")
+        self.assertEqual(end.astimezone(timezone.utc).isoformat(), "2026-09-30T21:00:00+00:00")
+        self.assertEqual(season.for_timestamp(int(end.timestamp()) - 1), "2026-09")
+        self.assertEqual(season.for_timestamp(int(end.timestamp())), "2026-10")
+        self.assertEqual((end - start).days, 30)
 
-    def test_countdown_units_declensions_and_nonnegative_boundary(self):
+    def test_year_boundary_and_leap_february(self):
+        self.assertEqual(season.bounds("2026-12")[1], season.bounds("2027-01")[0])
+        self.assertEqual((season.bounds("2028-02")[1] - season.bounds("2028-02")[0]).days, 29)
+        self.assertEqual((season.bounds("2027-02")[1] - season.bounds("2027-02")[0]).days, 28)
+
+    def test_countdown_units_and_boundary(self):
+        end = season.bounds("2026-09")[1]
         for remaining, expected in (
             (timedelta(days=18, hours=6), "18 дней 6 часов"),
             (timedelta(days=21, hours=1), "21 день 1 час"),
@@ -42,7 +53,8 @@ class CountdownTests(unittest.TestCase):
             (timedelta(days=-2), "0 минут"),
         ):
             with self.subTest(remaining=remaining):
-                self.assertEqual(season.format_countdown(season.SEASON_END_AT - remaining), expected)
+                self.assertEqual(season.format_countdown(end - remaining, identifier="2026-09"), expected)
+        self.assertEqual(season.format_countdown(end), "31 день 0 часов")
 
 
 class SeasonTests(unittest.IsolatedAsyncioTestCase):
@@ -52,10 +64,11 @@ class SeasonTests(unittest.IsolatedAsyncioTestCase):
         temporary = tempfile.TemporaryDirectory(prefix="turbo-season-test-")
         self.addCleanup(temporary.cleanup)
         self.enterContext(patch.object(db, "DB_PATH", Path(temporary.name) / "test.db"))
-        self.clock = self.enterContext(patch.object(season, "now", return_value=
-            season.SEASON_END_AT - timedelta(days=18, hours=6)))
+        self.end_at = season.bounds("2026-09")[1]
+        self.end = int(self.end_at.timestamp())
+        self.clock = self.enterContext(patch.object(season, "now", return_value=self.end_at - timedelta(days=1)))
+        self.enterContext(patch.object(db.time, "time", side_effect=lambda: self.clock.return_value.timestamp()))
         db.init_db()
-        self.end = int(season.SEASON_END_AT.timestamp())
         self.enterContext(patch.object(self.module, "_sync_cooldowns", {}))
         self.enterContext(patch.object(self.module, "MANUAL_SYNC_COOLDOWN", 0))
         self.profile = self.enterContext(patch.object(OpenDotaClient, "get_player", new=AsyncMock(
@@ -63,7 +76,7 @@ class SeasonTests(unittest.IsolatedAsyncioTestCase):
         )))
         self.history = self.enterContext(patch.object(OpenDotaClient, "get_turbo_matches_before", new=AsyncMock(return_value=[])))
         self.fetch = self.enterContext(patch.object(OpenDotaClient, "get_matches_for_sync", new=AsyncMock(return_value=[])))
-        self.enterContext(patch.object(OpenDotaClient, "get_match", new=AsyncMock(return_value={})))
+        self.details = self.enterContext(patch.object(OpenDotaClient, "get_match", new=AsyncMock(return_value={})))
         self.enterContext(patch.object(httpx.AsyncClient, "send", side_effect=AssertionError("Unexpected HTTP")))
         self.dispatcher = Dispatcher()
         self.dispatcher.include_router(self.module.router)
@@ -71,272 +84,300 @@ class SeasonTests(unittest.IsolatedAsyncioTestCase):
         self.bot = await self.enterAsyncContext(Bot(token="123456:LOCAL_ONLY_TEST_TOKEN"))
         self.outgoing = self.enterContext(patch.object(Bot, "__call__", new=AsyncMock(return_value=True)))
 
-    def player(self, account_id, rating=1000, nickname=None, *, linked=True):
-        db.add_player(account_id, nickname or f"Player {account_id}", self.end - 60 * 86400)
+    def player(self, account_id, rating=1000, *, linked=True):
+        db.add_player(account_id, f"Player {account_id}", self.end - 30 * 86400)
         db.create_rating(account_id, rating, [], 0)
         if linked:
             db.link_telegram_user(account_id, account_id)
 
-    def podium(self):
-        for account_id, rating, name in ((1, 1284, "Player One"), (2, 1210, "Stas"),
-                                         (3, 1178, "Player Three"), (4, 1000, "Fourth")):
-            self.player(account_id, rating, name)
+    def october(self):
+        self.clock.return_value = self.end_at + timedelta(minutes=5)
 
-    def close_season(self):
-        self.clock.return_value = season.SEASON_END_AT
-
-    def snapshot_row(self):
+    def snapshot(self):
         with db._connect() as connection:
-            return [tuple(row) for row in connection.execute("SELECT * FROM season_final_standings")]
+            return [tuple(row) for row in connection.execute("SELECT * FROM season_final_standings ORDER BY season_end_at")]
 
-    async def send(self, text, user_id=2):
+    async def send(self, text, user_id=1):
         self.outgoing.reset_mock()
         message = Message(message_id=1, date=self.clock.return_value, chat=Chat(id=user_id, type="private"),
                           from_user=User(id=user_id, is_bot=False, first_name="Test"), text=text)
         await self.dispatcher.feed_update(self.bot, Update(update_id=1, message=message))
         self.outgoing.assert_awaited_once()
-        return self.outgoing.await_args.args[0]
+        return self.outgoing.await_args.args[0].text
 
-    async def test_prizes_command_button_current_top_three_and_no_writes(self):
-        self.podium()
-        with db._connect() as connection:
-            before = list(connection.iterdump())
-        expected = ("💰 Призы сезона\n\n🥇 1 место — 3 000 ₽\n🥈 2 место — 2 000 ₽\n🥉 3 место — 1 000 ₽\n\n"
-                    "Сезон заканчивается:\n1 октября 2026\n\nДо окончания:\n18 дней 6 часов\n\n"
-                    "Текущий топ:\n🥇 Player One — 1284 TR\n🥈 Stas — 1210 TR\n🥉 Player Three — 1178 TR")
-        for user_id, keyboard in ((2, MAIN_KEYBOARD), (999, UNLINKED_KEYBOARD)):
-            for text in (PRIZES_BUTTON, "/prizes"):
-                response = await self.send(text, user_id)
-                self.assertEqual(response.text, expected)
-                self.assertEqual(response.reply_markup, keyboard)
-        with db._connect() as connection:
-            self.assertEqual(list(connection.iterdump()), before)
-        self.history.assert_not_awaited()
-
-    async def test_prizes_navigation_exits_account_input(self):
-        await self.send(LINK_BUTTON, 999)
-        self.assertIn("Текущий топ:", (await self.send(PRIZES_BUTTON, 999)).text)
-        state = self.dispatcher.fsm.get_context(bot=self.bot, chat_id=999, user_id=999)
-        self.assertIsNone(await state.get_state())
-
-    async def test_top_keeps_ranking_and_prizes_screen_has_countdown(self):
-        self.podium()
-        text = (await self.send("/top")).text
-        self.assertTrue(text.startswith("Turbo Rating"))
-        self.assertIn("🥈 Stas — 1210", text)
-        self.assertIn("← вы", text)
-        self.assertIn("4. Fourth — 1000", text)
-        prizes = (await self.send("/prizes")).text
-        self.assertIn("🥇 1 место — 3 000 ₽", prizes)
-        self.assertIn("🥈 2 место — 2 000 ₽", prizes)
-        self.assertIn("🥉 3 место — 1 000 ₽", prizes)
-        self.assertIn("До окончания:\n18 дней 6 часов", prizes)
-        self.assertIsNone(db.get_final_standings())
-
-    async def test_empty_and_partial_podium_before_and_after_deadline(self):
-        self.assertIn("Рейтинг игроков пока пуст.", (await self.send("/prizes")).text)
-        self.assertEqual("Turbo Rating\n\nРейтинг игроков пока пуст.", (await self.send("/top")).text)
-        self.player(1)
-        text = (await self.send("/prizes")).text.split("Текущий топ:")[1]
-        self.assertEqual(text.count(" TR"), 1)
-        self.close_season()
-        text = (await self.send("/prizes")).text
-        self.assertIn("🥇 Player 1 — 1000 TR — 3 000 ₽", text)
-        self.assertNotIn("🥈", text)
-
-    async def test_live_top_tracks_rating_until_last_instant(self):
-        self.player(1, 1000)
-        self.player(2, 1005)
-        self.clock.return_value = season.SEASON_END_AT - timedelta(microseconds=1)
-        db.save_match(1, match(100, self.end - 100))
-        self.assertEqual(len(apply_rating_changes(1)), 1)
-        self.assertEqual(db.get_rating(1)["current_rating"], 1025)
-        self.assertIn("🥇 Player 1 — 1025 TR", (await self.send("/prizes")).text)
-        self.assertEqual(self.snapshot_row(), [])
-
-    async def test_deadline_stops_pending_and_new_matches_for_every_player(self):
-        self.podium()
-        db.save_match(1, match(1, self.end - 100))
+    async def test_rollover_snapshots_ratings_places_and_stats_then_starts_at_1000(self):
+        self.player(1, 1435)
+        self.player(2, 1190)
+        db.save_match(1, match(1, self.end - 600))
+        db.save_match(1, match(2, self.end - 500, False))
         apply_rating_changes(1)
-        ratings = [db.get_rating(i) for i in range(1, 5)]
-        histories = [db.get_rating_history(i) for i in range(1, 5)]
-        db.save_match(1, match(2, self.end - 50))  # Delayed pre-deadline match.
-        self.close_season()
-        for i in range(1, 5):
-            db.save_match(i, match(3, self.end + 10))
-            self.assertEqual(apply_rating_changes(i), [])
-        self.assertEqual([db.get_rating(i) for i in range(1, 5)], ratings)
-        self.assertEqual([db.get_rating_history(i) for i in range(1, 5)], histories)
-        self.assertEqual(len(db.get_final_standings()), 4)
+        old_history = db.get_rating_history(1)
+        self.october()
+        with self.assertLogs("app.db", level="INFO") as logs:
+            self.assertEqual(db.ensure_current_season()["season_id"], "2026-10")
+        for event in ("rollover started", "snapshot completed", "Season created", "rollover completed"):
+            self.assertTrue(any(event in line for line in logs.output))
+        final = db.get_final_standings("2026-09")
+        self.assertEqual([(r["final_rating"], r["final_position"]) for r in final], [(1435, 1), (1190, 2)])
+        self.assertEqual((final[0]["matches_played"], final[0]["wins"], final[0]["losses"]), (2, 1, 1))
+        self.assertEqual([db.get_rating(i)["current_rating"] for i in (1, 2)], [1000, 1000])
+        self.assertEqual(db.get_rating(1)["initial_rating"], 1000)
+        self.assertEqual(db.get_rating_history(1), old_history)
+        self.assertIsNone(db.get_final_standings("2026-10"))
 
-    async def test_rating_transaction_crossing_deadline_rolls_back_whole_batch(self):
-        self.player(1)
-        for match_id in (1, 2):
-            db.save_match(1, match(match_id, self.end - 100 + match_id))
-        calls = 0
+    async def test_repeated_rollover_does_not_reset_already_earned_october_rating(self):
+        self.player(1, 1435)
+        self.october()
+        db.ensure_current_season()
+        db.save_match(1, match(1, self.end + 300))
+        apply_rating_changes(1)
+        before = self.snapshot()
+        for _ in range(3):
+            db.ensure_current_season()
+            db.init_db()
+        self.assertEqual(db.get_rating(1)["current_rating"], 1025)
+        self.assertEqual(self.snapshot(), before)
+        with db._connect() as connection:
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM seasons WHERE season_id = '2026-10'").fetchone()[0], 1)
 
+    async def test_before_midnight_late_sync_is_stored_in_september_without_rating(self):
+        self.player(1, 1435)
+        self.october()
+        self.fetch.return_value = [match(1, self.end - 600)]
+        for _ in range(2):
+            result = await sync_player(1)
+            self.assertEqual(result.rating_updates, [])
+        self.assertEqual(db.get_player_matches(1)[0]["season_id"], "2026-09")
+        self.assertEqual(db.get_rating(1)["current_rating"], 1000)
+        self.assertEqual(db.get_final_standings("2026-09")[0]["final_rating"], 1435)
+        self.assertEqual(db.get_rating_history(1), [])
+        self.assertIsNone(db.get_turbo_match_history(1)[0]["rating_delta"])
+        self.details.assert_not_awaited()
+
+    async def test_after_midnight_win_and_loss_start_from_1000_without_floor(self):
+        self.player(1, 1435)
+        self.player(2, 1190)
+        self.october()
+        for account_id, win, expected in ((1, True, 1025), (2, False, 975)):
+            self.fetch.return_value = [match(1, self.end + 300, win)]
+            result = await sync_player(account_id)
+            self.assertEqual(result.rating_updates[0].rating_before, 1000)
+            self.assertEqual(db.get_rating(account_id)["current_rating"], expected)
+            self.assertEqual(db.get_rating_history(account_id)[0]["season_id"], "2026-10")
+
+    async def test_restart_and_multiple_missed_months(self):
+        self.player(1, 1435)
+        self.clock.return_value = season.bounds("2027-01")[0]
+        db.init_db()
+        self.assertEqual(db.get_rating(1)["current_rating"], 1000)
+        self.assertEqual(db.ensure_current_season()["season_id"], "2027-01")
+        self.assertEqual(db.get_final_standings("2026-09")[0]["final_rating"], 1435)
+        self.assertEqual(db.get_final_standings("2026-12")[0]["final_rating"], 1000)
+        self.assertEqual(len(self.snapshot()), 4)
+
+    async def test_top_profile_prizes_and_seven_day_history_across_rollover(self):
+        self.player(2, 1435)
+        self.player(1, 1190)
+        db.save_match(2, match(1, self.end - 600))
+        apply_rating_changes(2)
+        self.october()
+        self.assertIn("Сезон: Октябрь 2026", await self.send("/top"))
+        top = db.get_leaderboard()
+        self.assertEqual([(r["account_id"], r["current_rating"]) for r in top], [(1, 1000), (2, 1000)])
+        self.assertEqual(db.get_leaderboard_position(1)["position"], 1)
+        self.assertIn("Turbo Rating: 1000 TR", await self.send("/profile"))
+        prizes = await self.send("/prizes")
+        self.assertIn("31.10.2026 23:59:59 МСК", prizes)
+        self.assertIn("Итоги: Сентябрь 2026\n🥇 Player 2 — 1460 TR — 3 000 ₽", prizes)
+        self.assertEqual(prizes, await self.send(PRIZES_BUTTON))
+        history = await self.send("/history", 2)
+        self.assertIn("30.09", history)
+        self.assertIn("+25 TR → 1460 TR", history)
+        self.assertNotIn("→ 1025", history)
+
+    async def test_late_performance_and_rename_cannot_mutate_snapshot_or_balances(self):
+        self.player(1, 1435)
+        db.save_match(1, match(1, self.end - 600))
+        apply_rating_changes(1)
+        self.october()
+        db.ensure_current_season()
+        before = self.snapshot()
+        old_history = db.get_rating_history(1)
+        db.save_match(1, match(2, self.end + 1))
+        apply_rating_changes(1)
+        self.assertIsNone(db.apply_match_performance(1, 1, {"performance_score": 1, "performance_bonus": 10}))
+        self.assertEqual(db.get_rating(1)["current_rating"], 1025)
+        self.assertEqual(db.get_rating_history(1)[1], old_history[0])
+        db.update_player_nickname(1, "New name")
+        self.player(2)
+        db.link_telegram_user(1, 2)
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(db.get_leaderboard_at(self.end - 1)[0]["nickname"], "Player 1")
+        self.assertEqual(db.get_final_standings("2026-09")[0]["final_rating"], 1460)
+
+    async def test_transaction_crossing_midnight_rolls_back_before_snapshot(self):
+        self.player(1, 1435)
+        for mid in (1, 2):
+            db.save_match(1, match(mid, self.end - 100 + mid))
         def calculate(current, win, bonus):
-            nonlocal calls
-            calls += 1
-            if calls == 2:
-                self.close_season()
+            self.october()
             return calculate_new_rating(current, win, bonus)
-
         self.assertEqual(db.apply_pending_ratings(1, calculate), [])
-        self.assertEqual(db.get_rating(1)["current_rating"], 1000)
         self.assertEqual(db.get_rating_history(1), [])
-        self.assertEqual(db.count_player_matches(1), 2)
-        self.assertEqual(db.get_final_standings()[0]["current_rating"], 1000)
+        self.assertEqual(db.get_final_standings("2026-09")[0]["final_rating"], 1435)
+        self.assertEqual(db.get_rating(1)["current_rating"], 1000)
 
-    async def test_sync_started_before_deadline_finishes_without_rating(self):
-        self.player(1)
-
-        async def delayed_fetch(*args):
-            self.close_season()
-            return [match(1, self.end - 10)]
-
-        self.fetch.side_effect = delayed_fetch
+    async def test_delayed_api_response_and_backwards_clock_cannot_reopen_season(self):
+        self.player(1, 1435)
+        async def delayed(*args):
+            self.october()
+            return [match(1, self.end - 600), match(2, self.end + 300)]
+        self.fetch.side_effect = delayed
         result = await sync_player(1)
-        self.assertEqual(result.new_count, 1)
-        self.assertEqual(result.rating_updates, [])
-        self.assertEqual(db.get_rating(1)["current_rating"], 1000)
-        self.assertEqual(db.get_rating_history(1), [])
-
-    async def test_calibration_response_after_deadline_does_not_create_season_rating(self):
-        db.add_player(1, "Late", self.end - 86400)
-
-        async def delayed_history(*args, **kwargs):
-            self.close_season()
-            return [match(1, self.end - 2 * 86400)]
-
-        self.history.side_effect = delayed_history
-        self.assertIsNone(await initialize_rating(1))
-        self.assertIsNone(db.get_rating(1))
-        self.assertEqual(db.get_player_matches(1, include_calibration=True), [])
-        self.assertEqual(db.get_final_standings(), [])
-
-    async def test_new_player_after_deadline_can_link_and_sync_without_calibration(self):
-        self.close_season()
-        self.assertIn("Dota-профиль подключён", (await self.send("/add 55", 55)).text)
-        tracking = db.get_player(55)["tracking_started_at"]
-        self.fetch.return_value = [match(1, max(tracking, self.end + 1))]
-        self.assertIn("Новых матчей сохранено: 1", (await self.send("/sync", 55)).text)
-        self.assertIn("Рейтинг в этом сезоне не рассчитан", (await self.send("/rating", 55)).text)
-        self.assertIsNone(db.get_rating(55))
-        self.assertEqual(db.count_player_matches(55), 1)
-        self.assertEqual(db.get_rating_history(55), [])
-        self.assertEqual(db.get_final_standings(), [])
+        self.assertEqual([u.match_id for u in result.rating_updates], [2])
+        self.assertEqual(db.get_rating(1)["current_rating"], 1025)
+        db.add_player(2, "Late calibration", self.end - 86400)
+        self.clock.return_value = self.end_at - timedelta(minutes=1)
+        self.assertEqual((await initialize_rating(2))["initial_rating"], 1000)
         self.history.assert_not_awaited()
 
-    async def test_final_screens_use_stored_winners(self):
-        self.podium()
-        self.close_season()
-        top = (await self.send("/top")).text
-        self.assertEqual(top, "🏆 Итоги сезона\n\n🥇 Player One — 1284 TR\n🥈 Stas — 1210 TR\n🥉 Player Three — 1178 TR")
-        prizes = (await self.send("/prizes")).text
-        self.assertEqual(prizes, "💰 Призы сезона\n\nСезон завершён.\n\nПобедители:\n"
-                                "🥇 Player One — 1284 TR — 3 000 ₽\n🥈 Stas — 1210 TR — 2 000 ₽\n🥉 Player Three — 1178 TR — 1 000 ₽")
-        self.assertEqual((await self.send(PRIZES_BUTTON)).text, prizes)
-        db.update_player_nickname(1, "Changed")
-        db.link_telegram_user(1, 4)
-        self.assertEqual((await self.send("/top")).text, top)
-        self.assertEqual((await self.send("/prizes")).text, prizes)
+    async def test_calibration_in_flight_at_rollover_becomes_1000(self):
+        db.add_player(1, "Late", self.end - 86400)
+        async def delayed(*args, **kwargs):
+            self.october()
+            return [match(1, self.end - 2 * 86400)]
+        self.history.side_effect = delayed
+        rating = await initialize_rating(1)
+        self.assertEqual((rating["initial_rating"], rating["calibration_matches"], rating["season_id"]), (1000, 0, "2026-10"))
+        self.assertEqual(db.get_player_matches(1, include_calibration=True), [])
 
-    async def test_first_rename_and_relink_at_deadline_freeze_previous_cohort(self):
-        self.podium()
-        self.player(9, 3000, "Unlinked", linked=False)
-        self.close_season()
-        db.link_telegram_user(1, 9)  # First operation since the deadline.
-        db.update_player_nickname(2, "Renamed")
-        final = db.get_final_standings()
-        self.assertEqual([row["account_id"] for row in final], [1, 2, 3, 4])
-        self.assertEqual(final[1]["nickname"], "Stas")
-        self.assertEqual(db.get_leaderboard_position(1)["position"], 1)
-        self.assertIsNone(db.get_leaderboard_position(9))
+    async def test_new_october_player_initializes_without_api_calibration(self):
+        self.october()
+        self.assertIn("Каждый новый сезон начинается с 1000 TR", await self.send("/add 55", 55))
+        rating = db.get_rating(55)
+        self.assertEqual((rating["initial_rating"], rating["current_rating"]), (1000, 1000))
+        self.history.assert_not_awaited()
 
-    async def test_first_rename_at_deadline_keeps_old_name(self):
-        self.player(1)
-        self.close_season()
-        db.update_player_nickname(1, "New name")
-        self.assertEqual(db.get_final_standings()[0]["nickname"], "Player 1")
-
-    async def test_repeated_autosync_saves_matches_without_changing_finals_or_history(self):
-        self.podium()
-        before = [db.get_rating(i) for i in range(1, 5)]
-        self.close_season()
-        self.fetch.return_value = [match(1, self.end - 10), match(2, self.end + 10)]
-        bot = AsyncMock(spec=Bot)
-        await sync_tracked_players(bot)
-        snapshot = self.snapshot_row()
-        for _ in range(2):
-            await sync_tracked_players(bot)
-        self.assertEqual(self.snapshot_row(), snapshot)
-        self.assertEqual([db.get_rating(i) for i in range(1, 5)], before)
-        self.assertEqual([db.count_player_matches(i) for i in range(1, 5)], [2] * 4)
-        self.assertTrue(all(db.get_rating_history(i) == [] for i in range(1, 5)))
-        self.assertEqual([row["nickname"] for row in db.get_final_standings()][:3], ["Player One", "Stas", "Player Three"])
-        bot.send_message.assert_not_awaited()
-
-    async def test_restart_ties_top_twenty_and_snapshot_written_only_once(self):
-        for i in reversed(range(1, 24)):
-            self.player(i)
-        db.link_telegram_user(100, 1)
-        self.close_season()
-        finals = await asyncio.gather(*(asyncio.to_thread(db.get_final_standings) for _ in range(8)))
-        self.assertTrue(all(final == finals[0] for final in finals))
-        self.assertEqual([row["account_id"] for row in finals[0]], list(range(1, 24)))
-        snapshot = self.snapshot_row()
-        self.assertEqual(len(snapshot), 1)
-        self.clock.return_value += timedelta(days=1)
-        db.init_db()
-        self.assertEqual(self.snapshot_row(), snapshot)
-        self.assertEqual(db.get_final_standings(), finals[0])
+    async def test_concurrent_rollover_and_sync_apply_exactly_once(self):
+        for account_id in range(1, 24):
+            self.player(account_id, 1435)
+        self.october()
+        db.save_match(1, match(1, self.end + 1))
+        await asyncio.gather(*(asyncio.to_thread(fn, *args) for fn, args in
+            [(db.ensure_current_season, ())] * 4 + [(apply_rating_changes, (1,))] * 4))
+        self.assertEqual(len(self.snapshot()), 1)
+        self.assertEqual(db.get_rating(1)["current_rating"], 1025)
+        self.assertEqual(db.count_rated_matches(1), 1)
         self.assertEqual(len(db.get_leaderboard()), 20)
         self.assertEqual(db.get_leaderboard_position(23)["position"], 23)
-        # Once closed, a backwards clock change cannot reopen this season.
-        self.clock.return_value = season.SEASON_END_AT - timedelta(days=1)
-        db.save_match(1, match(1, self.end - 100))
-        self.assertEqual(apply_rating_changes(1), [])
-        self.assertEqual(self.snapshot_row(), snapshot)
+        self.assertEqual([r["final_position"] for r in db.get_final_standings("2026-09")], list(range(1, 24)))
 
-    async def test_empty_season_is_finalized_even_without_tracked_players(self):
-        self.close_season()
-        await sync_tracked_players(AsyncMock(spec=Bot))
-        self.assertEqual(db.get_final_standings(), [])
-        snapshot = self.snapshot_row()
-        self.assertEqual(len(snapshot), 1)
-        self.assertEqual(snapshot[0][2], "[]")
-        db.init_db()
-        self.assertEqual(self.snapshot_row(), snapshot)
-        self.assertIn("Сезон завершён.", (await self.send("/prizes")).text)
+    async def test_failed_creation_or_reset_rolls_back_snapshot_and_closure(self):
+        self.player(1, 1435)
+        self.october()
+        for trigger in (
+            "CREATE TRIGGER fail BEFORE INSERT ON seasons WHEN NEW.season_id = '2026-10' BEGIN SELECT RAISE(ABORT, 'test'); END",
+            "CREATE TRIGGER fail BEFORE UPDATE ON ratings BEGIN SELECT RAISE(ABORT, 'test'); END",
+        ):
+            with db._connect() as connection:
+                connection.execute(trigger)
+            with self.assertRaises(sqlite3.IntegrityError):
+                db.ensure_current_season()
+            with db._connect() as connection:
+                self.assertIsNone(connection.execute("SELECT closed_at FROM seasons").fetchone()[0])
+                self.assertEqual(connection.execute("SELECT current_rating FROM ratings").fetchone()[0], 1435)
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM seasons").fetchone()[0], 1)
+                connection.execute("DROP TRIGGER fail")
+            self.assertEqual(self.snapshot(), [])
+        self.assertEqual(db.ensure_current_season()["season_id"], "2026-10")
 
-    async def test_migration_after_downtime_preserves_existing_data_and_fixes_standings(self):
-        self.podium()
-        db.save_match(1, match(1, self.end - 100))
+    async def test_unlinked_rating_preserved_without_prize_position(self):
+        self.player(1, 1435, linked=False)
+        self.october()
+        self.assertEqual(db.get_final_standings("2026-09"), [])
+        result = db.get_season_results("2026-09")[0]
+        self.assertEqual(result["final_rating"], 1435)
+        self.assertIsNone(result["final_position"])
+        self.assertEqual(db.get_rating(1)["current_rating"], 1000)
+        self.assertEqual(db.get_peak_rating(1), 1435)
+
+    async def test_rating_periods_and_archived_balance_do_not_mix_months(self):
+        self.player(1, 1435)
+        before_match = int(self.clock.return_value.timestamp()) - 1
+        db.save_match(1, match(1, before_match))
         apply_rating_changes(1)
-        tables = ("players", "matches", "ratings", "rating_history", "telegram_users")
-        with db._connect() as connection:
-            before = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]
-                      for table in tables}
-            connection.execute("DROP TABLE season_final_standings")
-        self.close_season()
-        db.init_db()
-        self.assertEqual(len(db.get_final_standings()), 4)
-        with db._connect() as connection:
-            after = {table: [tuple(row) for row in connection.execute(f"SELECT * FROM {table}")]
-                     for table in tables}
-            self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
-        self.assertEqual(after, before)
+        self.october()
+        self.assertEqual(db.get_rating_at(1, before_match), 1435)
+        self.assertEqual(db.get_rating_at(1, self.end - 1), 1460)
+        self.assertEqual(db.get_rating_at(1, self.end), 1000)
+        self.assertIsNone(db.get_rating_at(1, self.end - 31 * 86400))
+        db.save_match(1, match(2, self.end + 300, False))
+        apply_rating_changes(1)
+        self.assertEqual(db.get_rating_change(1, self.end - 7 * 86400), -25)
+        self.assertEqual(db.get_rating_at(1, self.end + 300), 975)
+        self.assertEqual(db.get_peak_rating(1), 1460)
 
-    async def test_autosync_fixes_standings_even_when_every_api_request_fails(self):
-        self.podium()
-        self.close_season()
+    async def test_snapshots_cannot_be_updated_or_deleted(self):
+        self.player(1, 1435)
+        self.october()
+        db.ensure_current_season()
+        before = self.snapshot()
+        for query in ("UPDATE season_final_standings SET standings_json = '[]'", "DELETE FROM season_final_standings"):
+            with self.assertRaises(sqlite3.IntegrityError):
+                with db._connect() as connection:
+                    connection.execute(query)
+        self.assertEqual(self.snapshot(), before)
+
+    async def test_empty_season_api_failure_and_background_recovery(self):
+        self.october()
+        await sync_tracked_players(AsyncMock(spec=Bot))
+        self.assertEqual(db.get_final_standings("2026-09"), [])
+        self.assertEqual(len(self.snapshot()), 1)
+        self.player(1)
+        self.clock.return_value = season.bounds("2026-11")[0]
         self.profile.side_effect = httpx.ReadTimeout("Unavailable")
         with self.assertLogs("app.autosync", level="ERROR"):
             await sync_tracked_players(AsyncMock(spec=Bot))
-        self.assertEqual([row["account_id"] for row in db.get_final_standings()], [1, 2, 3, 4])
-        self.assertEqual(len(self.snapshot_row()), 1)
-        self.assertTrue(all(db.get_rating_history(i) == [] for i in range(1, 5)))
+        self.assertEqual(db.ensure_current_season()["season_id"], "2026-11")
+        self.clock.return_value = season.bounds("2026-12")[0]
+        task = asyncio.create_task(run_season_rollover())
+        await asyncio.sleep(0)
+        self.assertEqual(db.get_rating(1)["season_id"], "2026-12")
+        task.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+
+
+class MigrationTests(unittest.TestCase):
+    def test_existing_september_balances_survive_repeatable_migration(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(db, "DB_PATH", Path(directory) / "legacy.db"), \
+                patch.object(season, "now", return_value=datetime(2026, 9, 15, tzinfo=season.MOSCOW)) as clock:
+            with closing(sqlite3.connect(db.DB_PATH)) as connection:
+                connection.executescript("""
+                    CREATE TABLE players (account_id INTEGER PRIMARY KEY, nickname TEXT,
+                        tracking_started_at INTEGER NOT NULL, created_at INTEGER NOT NULL);
+                    CREATE TABLE ratings (account_id INTEGER PRIMARY KEY, initial_rating REAL NOT NULL,
+                        current_rating REAL NOT NULL, calibration_matches INTEGER NOT NULL,
+                        calibration_wins INTEGER NOT NULL, initialized_at INTEGER NOT NULL);
+                    INSERT INTO players VALUES (1, 'A', 0, 0), (2, 'B', 0, 0);
+                    INSERT INTO ratings VALUES (1, 1100.25, 1435.75, 20, 13, 0), (2, 987, 1190, 20, 8, 0);
+                """)
+            db.init_db()
+            db.link_telegram_user(1, 1)
+            db.link_telegram_user(2, 2)
+            before = [db.get_rating(i) for i in (1, 2)]
+            db.init_db()
+            self.assertEqual([db.get_rating(i) for i in (1, 2)], before)
+            self.assertEqual([r["current_rating"] for r in before], [1435.75, 1190])
+            self.assertEqual([r["season_id"] for r in before], ["2026-09"] * 2)
+            self.assertIsNone(db.get_final_standings())
+            clock.return_value = season.bounds("2026-10")[0]
+            db.init_db()
+            self.assertEqual([r["final_rating"] for r in db.get_final_standings("2026-09")], [1435.75, 1190])
+            self.assertEqual([db.get_rating(i)["current_rating"] for i in (1, 2)], [1000, 1000])
+            with db._connect() as connection:
+                self.assertEqual(connection.execute("PRAGMA integrity_check").fetchone()[0], "ok")
+                self.assertEqual(connection.execute("PRAGMA foreign_key_check").fetchall(), [])
 
 
 if __name__ == "__main__":

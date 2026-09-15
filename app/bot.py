@@ -18,7 +18,7 @@ from aiogram.types import BotCommand, CallbackQuery, Message
 import httpx
 
 from app import db, season
-from app.autosync import run_autosync
+from app.autosync import run_autosync, run_season_rollover
 from app.notifications import format_rating_breakdown
 from app.keyboards import (
     MAIN_KEYBOARD, UNLINKED_KEYBOARD, get_main_keyboard, RATING_BUTTON,
@@ -34,7 +34,7 @@ from app.services.sync import MatchHistoryUnavailable, is_sync_in_progress, sync
 from app.services.rating import initialize_rating
 from app.screens import (
     format_home, format_top, format_matches,
-    format_profile, format_nickname as _nickname, format_prizes, format_season_results,
+    format_profile, format_nickname as _nickname, format_prizes,
 )
 
 
@@ -153,12 +153,11 @@ def _service_error(exc: Exception, fallback: str) -> str:
 def _leaderboard(account_id: int | None) -> str:
     at = season.now()
     leaderboard = db.get_leaderboard()
-    final = db.get_final_standings()
-    if final is not None:
-        return format_season_results(final)
     if not leaderboard:
         return format_top([], {}, account_id, None, at=at)
-    past_positions = {row["account_id"]: row["position"] for row in db.get_leaderboard_at(_week_ago())}
+    week_ago = _week_ago()
+    past_positions = ({row["account_id"]: row["position"] for row in db.get_leaderboard_at(week_ago)}
+                      if season.for_timestamp(week_ago) == season.season_id(at) else {})
     place = db.get_leaderboard_position(account_id) if account_id is not None else None
     return format_top(leaderboard, past_positions, account_id, place, at=at)
 
@@ -402,13 +401,6 @@ async def _connect_account(
     if state is not None:
         await state.clear()
     rating = result.rating
-    if rating is None and db.get_final_standings() is not None:
-        await message.answer(
-            f"Dota-профиль подключён.\n\n{_nickname(result.player)}\n\n"
-            "Сезон завершён. Матчи сохраняются без начисления TR.",
-            reply_markup=MAIN_KEYBOARD,
-        )
-        return
     if result.unchanged:
         status = f"Turbo Rating: {rating['current_rating']:.0f}" if rating else "Рейтинг пока не рассчитан."
         await message.answer(
@@ -426,7 +418,9 @@ async def _connect_account(
         )
         return
     count = rating["calibration_matches"]
-    if count == 1:
+    if rating["season_id"] > season.LEGACY_SEASON_ID:
+        explanation = "Каждый новый сезон начинается с 1000 TR."
+    elif count == 1:
         explanation = "Стартовый рейтинг рассчитан по последнему Turbo-матчу."
     elif count:
         explanation = f"Стартовый рейтинг рассчитан по последним {count} Turbo-матчам."
@@ -459,7 +453,7 @@ async def prizes_command(message: Message, state: FSMContext | None = None) -> N
     leaderboard = db.get_leaderboard(limit=3)
     final = db.get_final_standings()
     await message.answer(
-        format_prizes(final if final is not None else leaderboard, finished=final is not None, at=at),
+        format_prizes(leaderboard, at=at, previous_standings=final),
         reply_markup=get_main_keyboard(_player(message) is not None),
     )
 
@@ -468,7 +462,7 @@ async def _load_rating(message: Message, account_id: int, api_key: str | None):
     try:
         rating = await initialize_rating(account_id, api_key=api_key)
         if rating is None:
-            await message.answer("Сезон завершён. Рейтинг в этом сезоне не рассчитан.", reply_markup=MAIN_KEYBOARD)
+            await message.answer("Рейтинг пока не рассчитан. Попробуйте позже.", reply_markup=MAIN_KEYBOARD)
         return rating
     except (httpx.HTTPError, sqlite3.Error, ValueError) as exc:
         await message.answer(_service_error(exc, "Не удалось загрузить рейтинг. Попробуйте позже."))
@@ -568,14 +562,7 @@ async def sync_command(message: Message, api_key: str | None = None, state: FSMC
         f"\n\nPerformance пока недоступен для {result.performance_pending} матчей. "
         "Повторим расчёт при следующем обновлении."
     ) if result.performance_pending else ""
-    if db.get_final_standings() is not None:
-        rating = db.get_rating(player["account_id"])
-        status = f"\n\nTurbo Rating: {rating['current_rating']:.0f}" if rating else ""
-        await message.answer(
-            f"Сезон завершён.\nНовых матчей сохранено: {result.new_count}.\nTR сезона зафиксирован.{status}",
-            reply_markup=MAIN_KEYBOARD,
-        )
-    elif not result.rating_updates:
+    if not result.rating_updates:
         rating = db.get_rating(player["account_id"])
         await message.answer(
             f"Матчи обновлены.\n\nTurbo Rating: {rating['current_rating']:.0f}{pending_notice}"
@@ -634,10 +621,14 @@ async def run_bot(token: str, api_key: str | None = None) -> None:
         await load_heroes()
         await bot.set_my_commands(BOT_COMMANDS)
         task = asyncio.create_task(run_autosync(bot, api_key=api_key), name="turbo-autosync")
+        season_task = asyncio.create_task(run_season_rollover(), name="turbo-seasons")
         try:
             await dispatcher.start_polling(bot, api_key=api_key, close_bot_session=False)
         finally:
             task.cancel()
+            season_task.cancel()
             with suppress(asyncio.CancelledError):
                 await task
+            with suppress(asyncio.CancelledError):
+                await season_task
             logger.info("Bot stopped")

@@ -30,7 +30,7 @@ from app.services.accounts import link_dota_account
 from app.services.opendota import OpenDotaClient
 from app.services.rating import apply_rating_changes, calculate_initial_rating
 from app.services.sync import SyncResult
-from scripts.test_rating import match
+from scripts.test_rating import match, timestamp
 
 
 class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
@@ -42,7 +42,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temporary.cleanup)
         self.enterContext(patch.object(db, "DB_PATH", Path(temporary.name) / "test.db"))
         db.init_db()
-        db.add_player(42, "Old Player", 1000)
+        db.add_player(42, "Old Player", timestamp(1000))
         db.create_rating(42, 1074, [match(1, 900)], 1)
         db.save_match(42, match(2, 1001))
         apply_rating_changes(42)
@@ -339,7 +339,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(response.reply_markup, MAIN_KEYBOARD)
                 self.assertIsNone(await self.context().get_state())
                 self.assertEqual(self.snapshot(), before)
-        db.add_player(44, "Legacy", 900)
+        db.add_player(44, "Legacy", timestamp(900))
         db.link_telegram_user(202, 44)
         before = self.snapshot()
         self.assertIn("уже подключён", (await self.send("/add 44", user_id=202))[0].text)
@@ -417,7 +417,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(db.get_rating(43))
 
     async def test_sqlite_failure_rolls_back_final_link_update(self):
-        db.add_player(43, "Existing", 500)
+        db.add_player(43, "Existing", timestamp(500))
         db.create_rating(43, 1087, [], 0)
         with db._connect() as connection:
             connection.executescript("""
@@ -431,7 +431,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(db.get_telegram_player(201)["account_id"], 42)
 
     async def test_existing_account_and_return_preserve_rating_matches_and_calibration(self):
-        db.add_player(43, "Player 43", 500)
+        db.add_player(43, "Player 43", timestamp(500))
         db.create_rating(43, 1087, [match(50, 450)], 1)
         db.save_match(43, match(51, 501, False))
         apply_rating_changes(43)
@@ -459,7 +459,7 @@ class AccountSwitchTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("1070", response)
             self.assertNotIn("Old Player", response)
         top = (await self.send("/top"))[0].text
-        self.assertEqual(top.split("\n\n💰 Призы:")[0], "Turbo Rating\n\n🥇 Player 43 — 1070 ← вы")
+        self.assertEqual(top, "Turbo Rating\nСезон: Сентябрь 2026\n\n🥇 Player 43 — 1070 ← вы")
         self.assertIsNone(db.get_leaderboard_position(42))
         self.assertEqual(db.get_tracked_account_ids(), [43])
         with patch("app.autosync.sync_player", new=AsyncMock(return_value=SyncResult(0, []))) as sync:

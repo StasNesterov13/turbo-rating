@@ -4,7 +4,7 @@ import math
 import os
 from typing import Any
 
-from app import db
+from app import db, season
 from app.services.opendota import OpenDotaClient
 
 
@@ -164,10 +164,11 @@ async def initialize_rating(
     player = db.get_player(account_id)
     if player is None:
         raise ValueError("Игрок ещё не добавлен в БД.")
-    final = db.get_final_standings()
     existing = db.get_rating(account_id)
-    if existing is not None or final is not None:
+    if existing is not None:
         return existing
+    if db.ensure_current_season()["season_id"] > season.LEGACY_SEASON_ID:
+        return db.create_rating(account_id, season.INITIAL_RATING, [], 0)
 
     async with OpenDotaClient(
         api_key=api_key if api_key is not None else os.getenv("OPENDOTA_API_KEY") or None

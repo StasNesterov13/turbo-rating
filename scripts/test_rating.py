@@ -26,9 +26,17 @@ from app.services.rating import (
 from app.services.sync import sync_player, ensure_player
 
 
+TEST_EPOCH = int(datetime(2026, 9, 1, tzinfo=timezone.utc).timestamp())
+
+
+def timestamp(value):
+    """Small fixture times are seconds into September, full Unix times pass through."""
+    return TEST_EPOCH + value if value < 1000000 else value
+
+
 def match(match_id, start_time, win=True, game_mode=23, player_slot=0):
     return dict(
-        match_id=match_id, start_time=start_time, game_mode=game_mode,
+        match_id=match_id, start_time=timestamp(start_time), game_mode=game_mode,
         player_slot=player_slot, radiant_win=win if player_slot < 128 else not win,
         hero_id=44, duration=1458,
     )
@@ -94,7 +102,7 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(temporary.cleanup)
         self.enterContext(patch.object(db, "DB_PATH", Path(temporary.name) / "data" / "test.db"))
         db.init_db()
-        db.add_player(42, "Test Player", 1000)
+        db.add_player(42, "Test Player", timestamp(1000))
         self.history = self.enterContext(patch.object(
             OpenDotaClient, "get_turbo_matches_before", new=AsyncMock(return_value=[])
         ))
@@ -115,7 +123,7 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.new_count, 0)
         self.assertEqual(db.get_rating(42)["initial_rating"], 1000)
         self.assertEqual(db.get_player(42), original)
-        self.history.assert_awaited_once_with(42, 1000, limit=20)
+        self.history.assert_awaited_once_with(42, timestamp(1000), limit=20)
 
     async def test_calibration_saved_once_and_hidden(self):
         self.history.return_value = [match(i, 999 - i, i < 14) for i in range(20)]
@@ -177,8 +185,8 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
         with db._connect() as connection:
             connection.executemany(
                 """INSERT INTO rating_history (account_id, match_id, rating_before,
-                    expected_score, result, rating_delta, rating_after, created_at)
-                    VALUES (42, ?, ?, ?, ?, ?, ?, ?)""",
+                    expected_score, result, rating_delta, rating_after, created_at, season_id)
+                    VALUES (42, ?, ?, ?, ?, ?, ?, ?, '2026-09')""",
                 [(101, 1000.0, 0.5, 1, 16.0, 1016.0, 1001),
                  (102, 1016.0, 0.5230095872975, 0, -16.73630679352, 999.26369320648, 1002)],
             )
@@ -216,7 +224,7 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_party_match_is_independent_per_account(self):
         await initialize_rating(42)
-        db.add_player(43, "Party Player", 1000)
+        db.add_player(43, "Party Player", timestamp(1000))
         db.create_rating(43, 1200.0, [], 0)
         self.recent.return_value = [match(1, 1001)]
         await sync_player(42)
@@ -320,11 +328,11 @@ class RatingTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(db.get_rating(42))
                 profile = await command("/profile")
                 self.assertIn("Dota ID: 42", profile)
-                self.assertIn("Дата подключения:\n01.01.1970", profile)
+                self.assertIn("Дата подключения:\n01.09.2026", profile)
                 self.assertIn("Turbo Rating: 1000 TR", profile)
                 self.assertEqual(profile, await command("/rating"))
                 self.assertIsNotNone(db.get_rating(42))
-                db.add_player(43, "Lazy Rating", 1000)
+                db.add_player(43, "Lazy Rating", timestamp(1000))
                 db.link_telegram_user(101, 43)
                 self.assertIn("1000 TR", await command("/rating", 101))
                 self.assertIsNotNone(db.get_rating(43))
@@ -358,8 +366,8 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
                 return httpx.Response(200, json=data[offset:offset + params["limit"]],
                                       request=httpx.Request("GET", client.BASE_URL + path))
             with patch.object(client._client, "get", new=AsyncMock(side_effect=response)) as get:
-                result = await client.get_turbo_matches_before(42, 1000)
-                self.assertEqual([m["start_time"] for m in result], list(range(999, 979, -1)))
+                result = await client.get_turbo_matches_before(42, timestamp(1000))
+                self.assertEqual([m["start_time"] for m in result], [timestamp(t) for t in range(999, 979, -1)])
                 self.assertEqual([c.kwargs["params"]["offset"] for c in get.await_args_list], [0, 50, 100])
 
     async def test_short_page_deduplication_and_max_pages(self):
@@ -367,13 +375,13 @@ class PaginationTests(unittest.IsolatedAsyncioTestCase):
             with patch.object(client, "get_recent_turbo_matches", new=AsyncMock(side_effect=[
                 [match(1, 999), match(2, 998)], [match(2, 998)],
             ])) as fetch:
-                result = await client.get_turbo_matches_before(42, 1000, page_size=2)
+                result = await client.get_turbo_matches_before(42, timestamp(1000), page_size=2)
                 self.assertEqual([m["match_id"] for m in result], [1, 2])
                 self.assertEqual(fetch.await_count, 2)
             with patch.object(client, "get_recent_turbo_matches", new=AsyncMock(return_value=[
                 match(1, 1000), match(2, 1001),
             ])) as fetch:
-                self.assertEqual(await client.get_turbo_matches_before(42, 1000, page_size=2, max_pages=3), [])
+                self.assertEqual(await client.get_turbo_matches_before(42, timestamp(1000), page_size=2, max_pages=3), [])
                 self.assertEqual(fetch.await_count, 3)
 
 

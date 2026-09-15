@@ -1,19 +1,38 @@
-"""The single prize season and its Moscow deadline."""
+"""Calendar months in Moscow; stored boundaries are [start, next month)."""
 
 from datetime import datetime, timedelta, timezone
 
 
-# Moscow is UTC+3 on this season's deadline; no system timezone dependency.
-SEASON_END_AT = datetime(2026, 10, 1, 23, 59, 59, tzinfo=timezone(timedelta(hours=3), "Europe/Moscow"))
+MOSCOW = timezone(timedelta(hours=3), "Europe/Moscow")
+LEGACY_SEASON_ID = "2026-09"
+INITIAL_RATING = 1000.0
 PRIZES = {1: 3000, 2: 2000, 3: 1000}
+MONTHS = ("Январь", "Февраль", "Март", "Апрель", "Май", "Июнь",
+          "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь")
 
 
 def now() -> datetime:
-    return datetime.now(SEASON_END_AT.tzinfo)
+    return datetime.now(MOSCOW)
 
 
-def is_season_over(at: datetime | None = None) -> bool:
-    return (at if at is not None else now()) >= SEASON_END_AT
+def season_id(at: datetime | None = None) -> str:
+    return (at if at is not None else now()).astimezone(MOSCOW).strftime("%Y-%m")
+
+
+def for_timestamp(timestamp: int) -> str:
+    return season_id(datetime.fromtimestamp(timestamp, MOSCOW))
+
+
+def bounds(identifier: str) -> tuple[datetime, datetime]:
+    year, month = map(int, identifier.split("-"))
+    start = datetime(year, month, 1, tzinfo=MOSCOW)
+    end = datetime(year + (month == 12), month % 12 + 1, 1, tzinfo=MOSCOW)
+    return start, end
+
+
+def title(identifier: str) -> str:
+    start, _ = bounds(identifier)
+    return f"{MONTHS[start.month - 1]} {start.year}"
 
 
 def _unit(value: int, forms: tuple[str, str, str]) -> str:
@@ -28,11 +47,12 @@ def _unit(value: int, forms: tuple[str, str, str]) -> str:
     return f"{value} {forms[index]}"
 
 
-def format_countdown(at: datetime | None = None) -> str:
+def format_countdown(at: datetime | None = None, *, identifier: str | None = None) -> str:
     at = at if at is not None else now()
-    if is_season_over(at):
+    _, end = bounds(identifier or season_id(at))
+    if at >= end:
         return "0 минут"
-    seconds = int((SEASON_END_AT - at).total_seconds())
+    seconds = int((end - at).total_seconds())
     days, remainder = divmod(seconds, 86400)
     hours, remainder = divmod(remainder, 3600)
     minutes = remainder // 60
